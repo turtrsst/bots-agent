@@ -1,0 +1,30 @@
+# Kredensial — jangan pernah masuk repo
+.env
+client_secret.json
+token.json
+*.pem
+
+# Artefak runtime studio
+workspace/*
+!workspace/.gitkeep
+input_creator/*
+!input_creator/.gitkeep
+output_ready/*
+!output_ready/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

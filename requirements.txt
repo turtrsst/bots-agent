@@ -1,0 +1,11 @@
+# AutoGen "classic" (0.2.x) — API GroupChat/register_function yang dipakai proyek ini.
+# Catatan: 0.2.x adalah jalur maintenance; lihat README untuk opsi migrasi ke autogen-agentchat 0.4+.
+pyautogen==0.2.35
+
+# Memuat .env
+python-dotenv>=1.0,<2
+
+# YouTube Data API v3 (opsional — tanpa ini, upload berjalan dalam mode simulasi)
+google-api-python-client>=2.100,<3
+google-auth-oauthlib>=1.2,<2
+google-auth-httplib2>=0.2,<1
