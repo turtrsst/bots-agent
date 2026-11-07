@@ -1,0 +1,7 @@
+# Ekstra untuk mode --daemon / --serve (bridge HTTP n100n).
+# Daemon scheduler & file watcher TIDAK butuh dependensi ini: watcher memakai
+# polling murni (tanpa watchdog), notifikasi memakai urllib dari stdlib.
+-r requirements.txt
+
+fastapi>=0.110,<1
+uvicorn>=0.29,<1

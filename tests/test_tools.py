@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from studio.config import Settings, StudioPaths
-from studio.tools import RECEIPT_FILENAME, SIMULATION_MARKER, StudioTools
+from studio.tools import RECEIPT_FILENAME, SIMULATION_MARKER, TODO_FILENAME, StudioTools
 
 
 @pytest.fixture
@@ -113,3 +113,79 @@ def test_upload_rejects_overlong_title(tools: StudioTools, settings: Settings) -
 def test_upload_requires_existing_video(tools: StudioTools) -> None:
     result = tools.upload_to_youtube("missing.mp4", "Judul", "00:00", ["a"])
     assert result.startswith("ERROR UPLOAD")
+
+
+# ---------------------------------------------------------------- fase 2: async
+def test_async_gate_returns_awaiting_instead_of_blocking(settings: Settings) -> None:
+    gated = settings.with_changes(async_gate=True)
+    tools = StudioTools(gated)
+
+    result = tools.request_and_check_creator_files("Rekam A-Roll", "a_roll_raw.mp4")
+
+    assert "STATUS AWAITING" in result
+    assert "AWAITING_CREATOR_UPLOAD" in result
+    assert (gated.paths.workspace / TODO_FILENAME).exists()
+    assert not (gated.paths.input_creator / "a_roll_raw.mp4").exists()
+
+
+def test_async_gate_accepts_file_already_present(settings: Settings) -> None:
+    gated = settings.with_changes(async_gate=True)
+    gated.paths.ensure()
+    uploaded = gated.paths.input_creator / "a_roll_raw.mp4"
+    uploaded.write_bytes(b"footage")
+    tools = StudioTools(gated)
+
+    assert "STATUS UPLOADED" in tools.request_and_check_creator_files("Rekam", "a_roll_raw.mp4")
+
+
+# ------------------------------------------------------------- fase 2: render
+def test_real_render_runs_ffmpeg_pipeline(
+    settings: Settings, fake_ffmpeg: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = settings.with_changes(real_render=True)
+    tools = StudioTools(real)
+    from studio.media import Capabilities
+
+    monkeypatch.setattr(
+        "studio.tools.detect_capabilities", lambda _settings: Capabilities(ffmpeg=str(fake_ffmpeg))
+    )
+    (real.paths.input_creator / "a_roll_raw.mp4").write_bytes(b"real footage")
+
+    result = tools.assemble_and_render_video("a_roll_raw.mp4", "final_render.mp4", hook_title="Hook")
+
+    assert result.startswith("RENDER FISIK SELESAI")
+    report = json.loads((real.paths.output_ready / "final_render.render.json").read_text(encoding="utf-8"))
+    assert report["engine"] == "ffmpeg"
+    assert report["target_spec"]["resolution"] == "1920x1080"
+    assert {step["name"] for step in report["steps"]} >= {"normalize_audio", "conform", "finalize"}
+    assert tools.inspect_rendered_output("final_render.mp4").startswith("AUDIT LULUS")
+
+
+def test_real_render_without_ffmpeg_is_an_honest_error(settings: Settings) -> None:
+    real = settings.with_changes(real_render=True)
+    tools = StudioTools(real)
+    (real.paths.input_creator / "a_roll_raw.mp4").write_bytes(b"real footage")
+
+    result = tools.assemble_and_render_video("a_roll_raw.mp4", "final_render.mp4")
+
+    assert result.startswith("ERROR RENDER")
+    assert not (real.paths.output_ready / "final_render.mp4").exists()
+
+
+def test_audit_rejects_simulated_artifact_in_production_mode(settings: Settings) -> None:
+    real = settings.with_changes(real_render=True)
+    tools = StudioTools(real)
+    (real.paths.input_creator / "a_roll_raw.mp4").write_bytes(SIMULATION_MARKER + b"dummy")
+
+    tools.assemble_and_render_video("a_roll_raw.mp4", "final_render.mp4")
+
+    assert tools.inspect_rendered_output("final_render.mp4").startswith("AUDIT GAGAL")
+
+
+def test_render_tool_exposes_remotion_hook(settings: Settings) -> None:
+    import inspect
+
+    signature = inspect.signature(StudioTools(settings).build_functions()["assemble_and_render_video"])
+    assert "hook_title" in signature.parameters
+    assert "remotion_composition" in signature.parameters
+    assert signature.parameters["hook_title"].default == ""

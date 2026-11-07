@@ -8,6 +8,11 @@ Proyek ini adalah implementasi yang **sudah diperbaiki dan diuji** dari arsitekt
 `GroupChat` + `GroupChatManager` di artikel "Virtual Office Superbots". Versi asli
 tidak akan berjalan sesuai deskripsinya — lihat [Perbaikan penting](#perbaikan-penting).
 
+Sejak v2.0 kantor ini berjalan **24/7 tanpa terminal**: daemon membangunkan Vito
+sesuai jadwal, memantau folder `input_creator/`, merender dengan ffmpeg/Whisper/
+auto-editor/Remotion, mengingat performa video sebelumnya, dan mengabari Anda lewat
+Telegram. Lihat [Daemon 24/7](#6-daemon-247) dan [Integrasi KRA & n100n](#7-integrasi-kra--n100n).
+
 ```
 Creator_Kamu (topik)
       │
@@ -50,9 +55,14 @@ python virtual_office_superbots.py
 Perintah lain:
 
 ```bash
-python virtual_office_superbots.py --doctor          # cek API key, persona, ffmpeg, OAuth
+python virtual_office_superbots.py --doctor          # cek API key, persona, ffmpeg, Whisper, memori
 python virtual_office_superbots.py --mock-creator    # file A-Roll dummy otomatis (CI/demo)
 python virtual_office_superbots.py --real-render     # aktifkan ffmpeg asli
+python virtual_office_superbots.py --status          # antrean daemon + isi memori
+
+# mode 24/7 (tanpa terminal, tanpa input())
+python virtual_office_superbots.py --daemon          # scheduler + file watcher + notifikasi
+python virtual_office_superbots.py --serve           # bridge HTTP untuk webhook n100n (port 8100)
 ```
 
 Keluaran ada di `workspace/`, `input_creator/`, `output_ready/`:
@@ -78,7 +88,7 @@ Setiap bot memegang **hanya** tool sesuai perannya. Tool yang sama tidak dibagi 
 | Bot | Peran | Tool | Menyerahkan ke |
 |---|---|---|---|
 | `Creator_Kamu` | Anda (manusia) | — | Vito |
-| `Vito_TrendStrategist` | riset tren, judul, thumbnail | `save_content_brief` | Clara |
+| `Vito_TrendStrategist` | riset tren **nyata**, judul, thumbnail | `research_current_trends`, `save_content_brief` | Clara |
 | `Clara_Scriptwriter` | naskah retensi tinggi, A-Roll/B-Roll | `save_production_script` | Damon |
 | `Damon_RealityChecker` | QC + hak veto (2 gerbang) | `inspect_rendered_output` | Clara / Bima / Raka / Sora |
 | `Bima_StudioPM` | gatekeeper human-in-the-loop | `request_and_check_creator_files` | Raka |
@@ -110,6 +120,17 @@ cukup dengan mengedit `.md`-nya — tanpa menyentuh Python.
 | 11 | API key *fallback* berupa string di dalam kode | Rawan bocor | Hanya dari environment / `.env` |
 | 12 | Upload YouTube tanpa cache token | OAuth browser diminta setiap kali | `token.json` dipakai ulang, refresh otomatis |
 
+### Perbaikan tambahan v2.0 (mode 24/7)
+
+| # | Masalah | Perbaikan |
+|---|---|---|
+| 13 | Tool Bima memblokir `input()` → daemon mustahil | `STUDIO_ASYNC_GATE`: tool mengembalikan `STATUS AWAITING`, checklist dikirim via Telegram, rapat ditutup dengan `AWAITING_CREATOR_UPLOAD` |
+| 14 | `Daemon.stop()` menggantung saat Ctrl-C | Shutdown kooperatif (event + sentinel antrean) dengan `asyncio.wait` berbatas waktu, `cancel()` hanya sebagai jaring terakhir |
+| 15 | Webhook menerima nama file yang belum ada lalu seolah sukses | `409` bila file belum ada/0 byte; nama disanitasi dengan `Path(...).name` |
+| 16 | Render mengklaim sukses padahal ada langkah yang tak jalan | Setiap langkah `ok`/`skipped`/`failed` di sidecar; mode produksi menolak artefak simulasi |
+| 17 | Bot mengarang tren dari ingatan LLM | `research_current_trends` memanggil API nyata; tanpa kredensial → `RISET TIDAK TERSEDIA` dan dilarang mengarang angka |
+| 18 | Rekaman yang masuk saat bot mati tertinggal | `_resume_pending()` saat start: rapat `AWAITING_CREATOR_UPLOAD` + file tersedia → job produksi otomatis |
+
 ### Yang dipertahankan dari desain asli
 
 - `GroupChat` + `GroupChatManager` dengan `allowed_or_disallowed_speaker_transitions`.
@@ -125,14 +146,38 @@ Semua lewat environment (atau `.env`, dimuat otomatis):
 
 | Variabel | Default | Fungsi |
 |---|---|---|
+| **LLM** | | |
 | `STUDIO_API_KEY` | — | API key LLM (fallback: `OPENAI_API_KEY`) |
 | `STUDIO_BASE_URL` | OpenAI | Endpoint kompatibel OpenAI (Gemini, OpenRouter, Groq, LM Studio) |
 | `STUDIO_MODEL` | `gpt-4o` | Nama model |
 | `STUDIO_TEMPERATURE` | `0.4` | Kreativitas |
 | `STUDIO_MAX_ROUNDS` | `40` | Batas putaran group chat |
+| **Mode tool** | | |
 | `STUDIO_MOCK_CREATOR` | `0` | `1` = file A-Roll dummy otomatis |
-| `STUDIO_REAL_RENDER` | `0` | `1` = jalankan ffmpeg asli |
+| `STUDIO_REAL_RENDER` | `0` | `1` = jalankan pipeline media asli (butuh ffmpeg) |
+| `STUDIO_ASYNC_GATE` | `0` | `1` = tool Bima tidak pernah menunggu `input()` (otomatis `1` di `--daemon`) |
 | `STUDIO_CREATOR_TIMEOUT` | `0` | Batas tunggu upload Creator (detik, `0` = tanpa batas) |
+| **Media** | | |
+| `STUDIO_RENDER_FPS` | `60` | FPS output (resolusi selalu 1920×1080) |
+| `STUDIO_RENDER_CRF` | `20` | Kualitas x264 (kecil = lebih bagus) |
+| `STUDIO_WHISPER_MODEL` | `base` | Model Whisper: `tiny`/`base`/`small`/`medium`/`large` |
+| `STUDIO_REMOTION_DIR` | — | Folder repo Remotion KRA untuk intro/B-roll |
+| `STUDIO_REMOTION_COMPOSITION` | — | Nama composition default |
+| `STUDIO_BGM` | — | Musik latar (dicampur −24 dB) |
+| **Riset tren (Vito)** | | |
+| `STUDIO_YOUTUBE_API_KEY` | — | YouTube Data API v3 (API key saja, tanpa OAuth) |
+| `TAVILY_API_KEY` | — | Fallback tren web |
+| `SERPAPI_API_KEY` | — | Fallback pencarian YouTube |
+| **Daemon** | | |
+| `STUDIO_SCHEDULE` | — | Jadwal ideasi, mis. `07:00,16:00` (jam lokal) |
+| `STUDIO_SCHEDULE_TOPIC` | — | Topik tetap untuk jadwal (kosong = Vito memilih dari memori) |
+| `STUDIO_WATCH_INTERVAL` | `5` | Interval polling `input_creator/` (detik) |
+| `STUDIO_UPLOAD_SETTLE` | `4` | File dianggap selesai bila umurnya > N detik |
+| `STUDIO_DB` | `workspace/studio.db` | Lokasi database memori |
+| `STUDIO_NOTIFY` | `auto` | `auto`/`telegram`/`console`/`off` |
+| `STUDIO_TELEGRAM_TOKEN` | — | Token bot dari @BotFather |
+| `STUDIO_TELEGRAM_CHAT_ID` | — | Chat tujuan notifikasi & perintah masuk |
+| **Upload** | | |
 | `STUDIO_YOUTUBE_CATEGORY` | `22` | Kategori YouTube (22 = People & Blogs) |
 
 Contoh memakai Gemini (endpoint kompatibel OpenAI):
@@ -149,35 +194,223 @@ STUDIO_API_KEY=...
 
 ---
 
-## 5. Render video sungguhan
+## 5. Mesin media (render sungguhan)
 
-Secara default Raka menulis artefak **simulasi** (file dummy + laporan `engine:
-"simulation"`), supaya alur bisa diuji tanpa video asli. Untuk produksi:
+Tanpa `--real-render`, Raka menulis artefak **simulasi** (file dummy + laporan
+`engine: "simulation"`) supaya alur bisa diuji tanpa video asli. Dengan
+`--real-render`/`STUDIO_REAL_RENDER=1`, Raka menjalankan pipeline enam langkah yang
+sama dengan engine KRA:
 
-1. Rekam A-Roll sesuai `workspace/creator_todo_list.md`.
-2. Simpan sebagai `input_creator/a_roll_raw.mp4`.
-3. Jalankan dengan `--real-render` (butuh `ffmpeg` di `PATH`).
+| # | Langkah | Perintah | Butuh |
+|---|---|---|---|
+| 1 | `normalize_audio` | `ffmpeg -af loudnorm=I=-14:TP=-1.5:LRA=11` | ffmpeg |
+| 2 | `cut_dead_air` | `auto-editor --edit audio:threshold=0.04 --margin 0.15sec,0.25sec` | auto-editor |
+| 3 | `whisper` | `model.transcribe(language="id", word_timestamps=True)` → `.srt` + `.json` | openai-whisper |
+| 4 | `remotion` | `npx remotion render <composition> --props=...` (intro/hook) | Node + repo Remotion |
+| 5 | `concat` | normalisasi tiap segmen ke 1080p60 (scale/pad/setsar/fps) lalu `concat` | ffmpeg |
+| 6 | `finalize` | burn-in subtitle + BGM `-24dB` → `ffprobe` | ffmpeg (+ffprobe) |
 
-Raka lalu menjalankan:
+Setiap langkah dicatat sebagai `ok` / `skipped` / `failed` **beserta alasannya** di
+`output_ready/final_render.render.json`:
 
-```bash
-ffmpeg -i a_roll_raw.mp4 \
-  -vf "scale=1920:-2:flags=lanczos,fps=60" \
-  -af "loudnorm=I=-14:TP=-1.5:LRA=11" \
-  -c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p \
-  -c:a aac -b:a 192k -movflags +faststart final_render.mp4
+```json
+{
+  "engine": "ffmpeg",
+  "steps": [
+    {"name": "normalize_audio", "status": "ok", "seconds": 12.4},
+    {"name": "cut_dead_air", "status": "skipped", "detail": "auto-editor tidak terpasang"},
+    {"name": "whisper", "status": "failed", "detail": "ModuleNotFoundError: No module named 'whisper'"}
+  ],
+  "failed_steps": ["whisper"],
+  "specs": {"has_video": true, "duration_s": 183.4, "width": 1920, "height": 1080, "fps": "60/1"}
+}
 ```
 
-Input tanpa audio otomatis dirender ulang tanpa filter audio (dicatat di laporan).
-Untuk memotong jeda hening, pasang [auto-editor](https://github.com/WyattBlue/auto-editor)
-dan jalankan sebagai pra-langkah sebelum `a_roll_raw.mp4`.
+Prinsipnya: **langkah yang tidak bisa dijalankan dilewati dan dilaporkan**, tidak
+pernah diklaim berhasil. Bila `ffmpeg` sendiri tidak ada, tool mengembalikan
+`ERROR RENDER ...` (bukan file palsu), dan bila mode produksi aktif tetapi hasilnya
+masih artefak simulasi, Damon menolak dengan `AUDIT GAGAL`.
 
-Damon mengaudit hasil ini lewat `inspect_rendered_output`: file ada, bukan 0 byte,
-header MP4 valid, side-car ada, dan resolusi ≥ 1080p (dari `ffprobe`).
+Instalasi binary:
+
+```bash
+sudo apt install ffmpeg            # atau: brew install ffmpeg
+pip install -r requirements-media.txt   # auto-editor + openai-whisper
+```
+
+Damon mengaudit hasil lewat `inspect_rendered_output`: file ada, bukan 0 byte,
+header MP4 valid, side-car ada, SHA-256 cocok, dan resolusi ≥ 1080p (dari `ffprobe`).
 
 ---
 
-## 6. Upload YouTube sungguhan
+## 6. Daemon 24/7
+
+```bash
+python virtual_office_superbots.py --daemon
+```
+
+Tiga loop berjalan bersamaan di satu event loop:
+
+| Loop | Tugas |
+|---|---|
+| **worker** | menjalankan satu rapat pada satu waktu (AutoGen + render itu berat) |
+| **watcher** | memantau `input_creator/`; file video baru → job produksi otomatis masuk antrean |
+| **scheduler** | memicu fase ideasi sesuai `STUDIO_SCHEDULE` (mis. `07:00`) |
+| **telegram** | membaca perintah masuk: `/status`, `/topic <ide>`, `/produce`, `/help` |
+
+Alur nyata tanpa Anda menyentuh terminal:
+
+1. 07:00 — Vito bangun, ambil tren YouTube hari ini, brief + naskah + QC selesai.
+2. Bima mengirim **checklist rekaman** ke Telegram dan rapat ditutup dengan status
+   `AWAITING_CREATOR_UPLOAD` (bukan menggantung menunggu `Enter`).
+3. Anda merekam, lalu menaruh file di `input_creator/`.
+4. Watcher mendeteksi file (menunggu `STUDIO_UPLOAD_SETTLE` detik agar copy selesai),
+   mengantrekan fase produksi, Raka render, Damon audit, Sora upload, lalu notifikasi
+   berisi URL video.
+
+Job yang gagal tidak menghentikan daemon: statusnya `failed`, alasannya dikirim ke
+notifikasi, dan rapat berikutnya tetap jalan. Setelah restart, daemon memeriksa
+kembali file yang sudah ada untuk rapat berstatus `AWAITING_CREATOR_UPLOAD`
+(`_resume_pending`) — jadi rekaman yang masuk saat bot mati tidak hilang.
+
+Menjalankan permanen (systemd, Linux):
+
+```ini
+# /etc/systemd/system/kantor-rama.service
+[Unit]
+Description=Kantor Rama AI — studio daemon
+After=network-online.target
+
+[Service]
+WorkingDirectory=/opt/kantor-rama-ai
+EnvironmentFile=/opt/kantor-rama-ai/.env
+ExecStart=/opt/kantor-rama-ai/.venv/bin/python virtual_office_superbots.py --daemon
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable --now kantor-rama
+journalctl -u kantor-rama -f
+```
+
+macOS: `launchd` dengan `KeepAlive`. Windows: Task Scheduler ("At startup") atau
+`nssm`. Untuk Telegram, buat bot lewat @BotFather, kirim `/start` ke bot, lalu ambil
+`chat.id` Anda dari `https://api.telegram.org/bot<TOKEN>/getUpdates`.
+
+---
+
+## 7. Integrasi KRA & n100n
+
+Studio ini bukan pulau terpisah: ia memakai struktur folder `kantor-rama-ai`.
+
+```env
+STUDIO_ROOT=/path/ke/kantor-rama-ai
+STUDIO_REMOTION_DIR=/path/ke/kantor-rama-ai/remotion_studio
+```
+
+```
+kantor-rama-ai/
+├── input_creator/      # Anda menaruh a_roll_raw.mp4 di sini
+├── workspace/          # brief, naskah, transkrip, studio.db
+├── output_ready/       # final_render.mp4 + sidecar
+└── remotion_studio/    # repo Remotion (intro/B-roll)
+```
+
+Bridge HTTP untuk scheduler lokal `n100n`:
+
+```bash
+python virtual_office_superbots.py --serve --host 0.0.0.0 --port 8100
+```
+
+| Endpoint | Fungsi |
+|---|---|
+| `POST /kra/n100n-trigger` | fase `IDEATION_SCRIPT` atau `PRODUCE_AND_UPLOAD` |
+| `GET /health` | hidup + kapabilitas media (`ffmpeg`, `whisper`, `remotion`) |
+| `GET /status` | antrean, job terakhir, isi memori, file yang menunggu |
+| `GET /jobs/{id}` | detail satu job |
+
+Payload & contoh (sama dengan `kra_raka_engine.py` milik KRA):
+
+```bash
+# pagi: ideasi + naskah
+curl -s -X POST http://127.0.0.1:8100/kra/n100n-trigger \
+  -H 'Content-Type: application/json' \
+  -d '{"phase": "IDEATION_SCRIPT", "topic_or_prompt": "Tren AI minggu ini"}'
+
+# sore: rekaman sudah ada → produksi + upload
+curl -s -X POST http://127.0.0.1:8100/kra/n100n-trigger \
+  -H 'Content-Type: application/json' \
+  -d '{"phase": "PRODUCE_AND_UPLOAD", "raw_video_filename": "a_roll_raw.mp4",
+       "remotion_composition": "Intro"}'
+```
+
+Respons `202` berisi `{"status": "queued", "phase": ..., "job": {...}}`. Bila file
+rekaman belum ada, endpoint menjawab `409` — `n100n` tahu harus menunggu, bukan
+menganggap render berhasil. Nama file disanitasi (`Path(...).name`), jadi
+`../../etc/passwd` tidak bisa dipakai.
+
+Contoh pemanggilan dari `n100n` (cron):
+
+```cron
+0 7  * * *  curl -s -X POST http://127.0.0.1:8100/kra/n100n-trigger -H 'Content-Type: application/json' -d '{"phase":"IDEATION_SCRIPT"}'
+```
+
+> `PRODUCE_AND_UPLOAD` **tidak wajib** dipanggil cron: watcher `input_creator/`
+> sudah otomatis memicunya begitu rekaman muncul. Panggil endpoint itu bila `n100n`
+> ingin memaksa render ulang.
+
+Catatan soal `kra_raka_engine.py` yang Anda kirim: alurnya (normalize → auto-editor →
+whisper → remotion → concat/burn → ffprobe) sudah diadopsi di `studio/media.py`, tetapi
+beberapa detailnya diperbaiki — nama fungsi `step_6_ interrogate_final_specs` adalah
+syntax error, `whisper.utils.get_writer(...)` berubah antar versi (di sini SRT ditulis
+sendiri dari `segments`), dan argumen `--margin 0.15sec,0.25sec` serta `volume=-24dB`
+tergantung versi binary. Engine baru juga menandai setiap langkah yang dilewati/gagal,
+sesuatu yang tidak dilakukan skrip asli.
+
+---
+
+## 8. Memori jangka panjang
+
+`workspace/studio.db` (SQLite, WAL, tanpa dependensi tambahan):
+
+| Tabel | Isi |
+|---|---|
+| `runs` | setiap rapat: topik, status, brief, path naskah/video, URL YouTube, error |
+| `videos` | video yang tayang + performa (`views`, `ctr`, catatan) |
+| `topics` | topik yang pernah dibahas |
+
+Sebelum rapat dimulai, `MemoryStore.prompt_context()` merangkum riwayat dan
+menyuntikkannya ke system prompt **Vito dan Sora saja**:
+
+```text
+## MEMORI STUDIO (3 rapat terakhir, 2 video tercatat)
+- 2026-11-01 | Workflow editing video 2026 | PIPELINE_COMPLETE | judul: 5 Tool Editing ...
+Performa video (pakai ini untuk memilih sudut pandang, bukan mengarang statistik):
+- 5 Tool Editing Video → 2500 views, CTR 7.5% — CTR bagus
+Aturan memori: jangan mengulang topik/judul di atas; ...
+```
+
+Mengisi performa (mis. setelah seminggu, dari YouTube Analytics atau `n100n`):
+
+```python
+from pathlib import Path
+from studio.memory import MemoryStore
+
+memory = MemoryStore(Path("workspace/studio.db"))
+memory.record_performance("https://youtu.be/xxxx", views=18400, ctr=6.8, notes="judul A menang")
+print(memory.stats())        # {'runs': 12, 'completed': 9, ..., 'total_views': 51000}
+print(memory.prompt_context())
+```
+
+Memeriksa dari terminal: `python virtual_office_superbots.py --status`.
+
+---
+
+## 9. Upload YouTube sungguhan
 
 1. Buat project di [Google Cloud Console](https://console.cloud.google.com/) → aktifkan
    **YouTube Data API v3**.
@@ -192,19 +425,27 @@ Tanpa `client_secret.json`, Sora menulis `youtube_publish_receipt.json` berstatu
 
 ---
 
-## 7. Arsitektur kode
+## 10. Arsitektur kode
 
 ```
-virtual_office_superbots.py   # CLI tipis: argumen, banner, ringkasan
+virtual_office_superbots.py   # CLI tipis: --rehearsal | --daemon | --serve | --status | --doctor
 studio/
-  config.py                   # Settings, path studio, llm_config
+  config.py                   # Settings (frozen), path studio, llm_config, deteksi env
   personas.py                 # muat agents/*.md + kontrak kerja
-  tools.py                    # 6 tool nyata (filesystem, ffmpeg, YouTube)
-  office.py                   # spesifikasi bot, graf transisi, GroupChat
+  tools.py                    # 7 tool nyata (riset, filesystem, media, YouTube)
+  office.py                   # spesifikasi bot, graf transisi per fase, GroupChat
+  media.py                    # pipeline ffmpeg/auto-editor/Whisper/Remotion + ffprobe
+  research.py                 # tren nyata: YouTube Data API, Tavily, SerpAPI
+  memory.py                   # SQLite: runs, videos, topics, prompt_context()
+  notify.py                   # Telegram Bot API (urllib) + konsol
+  daemon.py                   # antrean job, watcher, scheduler, perintah Telegram
+  api.py                      # FastAPI: /kra/n100n-trigger, /health, /status
   report.py                   # transkrip & ringkasan run
   rehearsal.py                # pipeline deterministik tanpa LLM
 agents/*.md                   # persona 6 bot
-tests/                        # unit test + e2e GroupChat dengan LLM palsu
+tests/                        # 83 test: unit, daemon, API, e2e GroupChat dengan LLM palsu
+requirements-daemon.txt       # fastapi + uvicorn (mode --serve)
+requirements-media.txt        # openai-whisper (+ catatan ffmpeg/auto-editor/remotion)
 ```
 
 Alasan pemisahan ini: orkestrasi AutoGen 0.2 (`office.py`) terisolasi dari tool dan
@@ -233,17 +474,22 @@ tetap macet, `max_round` menghentikannya dan laporan berstatus
 
 ---
 
-## 8. Test
+## 11. Test
 
 ```bash
 pip install -r requirements-dev.txt
-pytest            # 31 test
+pytest            # 83 test
 ruff check .
 ```
 
-- `tests/test_tools.py` — validasi filesystem, path traversal, render, audit, upload.
-- `tests/test_office.py` — struktur 6 bot, kepemilikan tool, graf transisi, terminasi.
+- `tests/test_tools.py` — filesystem, path traversal, render nyata (ffmpeg palsu), audit, upload, async gate.
+- `tests/test_office.py` — struktur 6 bot, kepemilikan tool, graf transisi per fase, terminasi.
 - `tests/test_rehearsal.py` — pipeline deterministik tanpa LLM.
+- `tests/test_media.py` — deteksi kapabilitas, langkah yang gagal **dilaporkan** bukan disembunyikan, SRT/subtitle filter.
+- `tests/test_memory.py` — upsert run, performa video, konteks memori, persistensi antar-proses.
+- `tests/test_daemon.py` — jadwal, watcher (file muncul sekali), antrean job, resume, perintah Telegram, shutdown.
+- `tests/test_api.py` — webhook n100n: 202, 409, 422, sanitasi path.
+- `tests/test_research.py` — parsing YouTube/Tavily, fallback antar-provider, dan perilaku jujur tanpa kredensial.
 - `tests/test_group_chat_e2e.py` — **GroupChat sungguhan** dengan `OpenAIWrapper.create`
   yang dipalsukan: membuktikan tool dieksekusi oleh bot yang tepat, loop
   Damon-menolak-Clara berjalan, dan rapat berhenti karena `PIPELINE_COMPLETE`, bukan
@@ -254,7 +500,7 @@ dijawab deterministik, tetapi seluruh mesin AutoGen tetap berjalan.
 
 ---
 
-## 9. Troubleshooting
+## 12. Troubleshooting
 
 | Gejala | Penyebab & solusi |
 |---|---|
@@ -265,10 +511,16 @@ dijawab deterministik, tetapi seluruh mesin AutoGen tetap berjalan.
 | Render tetap `simulation` | `--real-render` belum aktif, `ffmpeg` tidak ada, atau input masih file dummy |
 | `ERROR UPLOAD LIVE` | `client_secret.json` salah/scope belum disetujui; hapus `token.json` lalu ulangi |
 | Rapat kehabisan round | Naikkan `--max-rounds`; lihat transkrip untuk bot yang berputar-putar |
+| `STATUS AWAITING` muncul terus | Mode daemon menunggu file di `input_creator/`. Cek `/status` untuk melihat file yang terdeteksi |
+| Daemon tidak bereaksi pada file baru | Pastikan ekstensinya video (`.mp4/.mov/.mkv/.webm/.avi`) dan umurnya > `STUDIO_UPLOAD_SETTLE` |
+| Notifikasi tidak masuk | Isi `STUDIO_TELEGRAM_TOKEN` + `STUDIO_TELEGRAM_CHAT_ID`; kirim `/start` ke bot dulu. Cek `--doctor` |
+| `webhook 409` | File `raw_video_filename` belum ada/0 byte di `input_creator/` — tunggu copy selesai |
+| `RISET TIDAK TERSEDIA` | Isi `STUDIO_YOUTUBE_API_KEY` (cukup API key) atau Tavily/SerpAPI. Vito dilarang mengarang tren |
+| Subtitle tidak ada / `whisper: failed` | `pip install -r requirements-media.txt`; cek `steps` di `.render.json` |
 
 ---
 
-## 10. Catatan versi AutoGen
+## 13. Catatan versi AutoGen
 
 Repo ini memakai `pyautogen 0.2.35` karena artikel dan API yang dimaksud
 (`GroupChat`, `GroupChatManager`, `register_function`, `allowed_or_disallowed_speaker_transitions`)
@@ -278,7 +530,7 @@ AutoGen 0.4+ (`autogen-agentchat`: `RoundRobinGroupChat`, `SelectorGroupChat`,
 Struktur repo ini memudahkan migrasi: hanya `studio/office.py` yang perlu diganti,
 tool dan persona tetap.
 
-## 11. Keamanan
+## 14. Keamanan
 
 - `.env`, `client_secret.json`, `token.json` sudah di-`.gitignore`. Jangan commit.
 - Token OAuth memberi akses upload ke channel Anda — perlakukan seperti password.

@@ -28,9 +28,16 @@ from .config import Settings
 from .personas import Persona, compose_system_message, load_persona
 from .report import collect_files, write_run_report, youtube_url_from_receipt
 
-TERMINATION_KEYWORD = "PIPELINE_COMPLETE"
+TERMINATION_KEYWORDS = ("PIPELINE_COMPLETE", "AWAITING_CREATOR_UPLOAD")
+TERMINATION_KEYWORD = TERMINATION_KEYWORDS[0]  # alias kompatibilitas
+STAGES = ("full", "ideation", "production")
 
 TOOL_DESCRIPTIONS: dict[str, str] = {
+    "research_current_trends": (
+        "Ambil tren YouTube/tren web HARI INI yang nyata (YouTube Data API, Tavily, atau "
+        "SerpAPI) untuk topik tertentu. Panggil sebelum menyusun brief; kalau hasilnya "
+        "'RISET TIDAK TERSEDIA', jangan mengarang angka tren."
+    ),
     "save_content_brief": (
         "Simpan content brief (3 judul, thumbnail, angle, audiens, keyword) ke "
         "./workspace/content_brief.json. Panggil setelah brief selesai, jangan hanya menulis di chat."
@@ -88,6 +95,8 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
         ),
         protocol=(
             "## ALUR KERJAMU\n"
+            "0. Panggil `research_current_trends` lebih dulu untuk melihat tren nyata hari ini. "
+            "Kalau hasilnya 'RISET TIDAK TERSEDIA', jangan mengarang angka tren.\n"
             "1. Riset sudut pandang yang belum jenuh untuk topik Creator.\n"
             "2. Tulis brief: 3 judul (<55 karakter), 3 konsep thumbnail, angle, target audiens, "
             "3 keyword.\n"
@@ -99,7 +108,7 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
             "Clara_Scriptwriter, brief saya sudah final di ./workspace/content_brief.json. "
             "Silakan tulis naskahnya sekarang."
         ),
-        tools=("save_content_brief",),
+        tools=("research_current_trends", "save_content_brief"),
         handoff=("Clara_Scriptwriter",),
     ),
     AgentSpec(
@@ -191,7 +200,10 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
             "3. Panggil `request_and_check_creator_files(...)` dengan expected_filename 'a_roll_raw.mp4'.\n"
             "4. Bila hasilnya `STATUS UPLOADED`, serahkan ke Raka_Producer dengan spesifikasi render.\n"
             "5. Bila `STATUS BLOCKED`/`TIMEOUT`/`CANCELLED`, hentikan pipeline dan laporkan ke Creator; "
-            "jangan menyuruh Raka bekerja."
+            "jangan menyuruh Raka bekerja.\n"
+            "6. Bila tool mengembalikan `STATUS AWAITING` (mode daemon), Creator akan dihubungi lewat "
+            "notifikasi. Tutup rapat sekarang dengan kata kunci AWAITING_CREATOR_UPLOAD — jangan "
+            "menyuruh Raka render di fase ini."
         ),
         default_reply=(
             "Raka_Producer, file Creator sudah saya verifikasi ada di ./input_creator/. Silakan render."
@@ -260,7 +272,33 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
 AGENT_BY_KEY = {spec.key: spec for spec in AGENT_SPECS}
 
 
-def kickoff_message(topic: str) -> str:
+def kickoff_message(topic: str, stage: str = "full", raw_file: str = "") -> str:
+    if stage == "ideation":
+        return (
+            "FASE IDEASI DIMULAI (belum masuk produksi).\n"
+            f"Topik dari Creator: '{topic}'.\n\n"
+            "1. Vito_TrendStrategist — brief + 3 judul ber-CTR tinggi → `save_content_brief`.\n"
+            "2. Clara_Scriptwriter — naskah dengan [CREATOR A-ROLL]/[AI B-ROLL] → `save_production_script`.\n"
+            "3. Damon_RealityChecker — audit naskah, minta revisi bila perlu, setujui bila layak.\n"
+            "4. Bima_StudioPM — setelah disetujui, panggil tool untuk menagih 'a_roll_raw.mp4' ke Creator.\n\n"
+            # kata kunci terminasi tidak boleh muncul di pesan kickoff
+            "Mode daemon: tool Bima tidak akan memblokir terminal. Bila hasilnya STATUS AWAITING, "
+            "tutup rapat dengan kata kunci penutup yang ada di system prompt Bima. "
+            "Jangan menyuruh Raka render di fase ini."
+        )
+    if stage == "production":
+        raw = raw_file or "a_roll_raw.mp4"
+        return (
+            "FASE PRODUKSI DIMULAI.\n"
+            f"Rekaman Creator: '{raw}' sudah tersedia di ./input_creator/.\n"
+            f"Naskah & brief sudah ada di ./workspace/ dan sudah disetujui Damon.\n\n"
+            "1. Raka_Producer — panggil tool render: 'a_roll_raw.mp4' → 'final_render.mp4' "
+            "(hook_title diambil dari judul pemenang di content_brief.json).\n"
+            "2. Damon_RealityChecker — audit bukti fisik file hasil render.\n"
+            "3. Sora_YouTubePublisher — upload dengan metadata SEO + Chapters, lalu tutup rapat "
+            "dengan kata kunci penutup.\n\n"
+            "Jangan mengulang riset/naskah; fokus ke produksi dan publikasi."
+        )
     return (
         "PROYEK BARU DIMULAI!\n"
         f"Topik dari Creator: '{topic}'.\n\n"
@@ -287,6 +325,7 @@ class RunSummary:
     completed: bool
     rounds: int
     elapsed_seconds: float
+    awaiting_creator: bool = False
     files: list[str] = field(default_factory=list)
     youtube_url: str = ""
     transcript_path: str | None = None
@@ -294,12 +333,16 @@ class RunSummary:
 
     @property
     def status(self) -> str:
-        return "PIPELINE_COMPLETE" if self.completed else "BERHENTI TANPA PIPELINE_COMPLETE"
+        if self.awaiting_creator:
+            return "AWAITING_CREATOR_UPLOAD"
+        if self.completed:
+            return "PIPELINE_COMPLETE"
+        return "BERHENTI TANPA PIPELINE_COMPLETE"
 
 
 def _is_complete(message: dict[str, Any] | None) -> bool:
-    content = (message or {}).get("content") or ""
-    return TERMINATION_KEYWORD in str(content).upper()
+    content = str((message or {}).get("content") or "").upper()
+    return any(keyword in content for keyword in TERMINATION_KEYWORDS)
 
 
 def continuation_selector(last_speaker, groupchat):
@@ -317,8 +360,25 @@ def continuation_selector(last_speaker, groupchat):
     return "auto"
 
 
-def build_transitions(agents: dict[str, ConversableAgent], creator: ConversableAgent) -> dict:
-    """Graf pembicara: Damon punya jalur balik (maker-checker loop)."""
+def build_transitions(
+    agents: dict[str, ConversableAgent], creator: ConversableAgent, stage: str = "full"
+) -> dict:
+    """Graf pembicara per fase. Damon punya jalur balik (maker-checker loop)."""
+    if stage == "ideation":
+        return {
+            creator: [agents["vito"]],
+            agents["vito"]: [agents["clara"]],
+            agents["clara"]: [agents["damon"]],
+            agents["damon"]: [agents["clara"], agents["bima"]],
+            # Bima sengaja tidak punya tujuan: rapat berakhir setelah ia menagih file.
+        }
+    if stage == "production":
+        return {
+            creator: [agents["raka"]],
+            agents["raka"]: [agents["damon"]],
+            agents["damon"]: [agents["raka"], agents["sora"]],
+            agents["sora"]: [agents["damon"]],
+        }
     # Tanpa self-loop: giliran setelah tool sudah dijamin oleh continuation_selector,
     # sehingga graf ini murni maju dan bot tidak bisa "ngobrol sendiri" berputar-putar.
     return {
@@ -349,6 +409,7 @@ class Office:
         group_chat: GroupChat,
         manager: GroupChatManager,
         persona_sources: dict[str, Persona],
+        stage: str = "full",
     ) -> None:
         self.settings = settings
         self.tools = tools
@@ -357,13 +418,14 @@ class Office:
         self.group_chat = group_chat
         self.manager = manager
         self.persona_sources = persona_sources
+        self.stage = stage
 
     # ------------------------------------------------------------------ run
-    def run(self, topic: str) -> RunSummary:
+    def run(self, topic: str, *, raw_file: str = "") -> RunSummary:
         started = time.monotonic()
         self.creator.initiate_chat(
             self.manager,
-            message=kickoff_message(topic),
+            message=kickoff_message(topic, self.stage, raw_file=raw_file),
             clear_history=True,
         )
         elapsed = time.monotonic() - started
@@ -375,6 +437,10 @@ class Office:
         summary = RunSummary(
             topic=topic,
             completed=completed,
+            awaiting_creator=any(
+                "AWAITING_CREATOR_UPLOAD" in str(message.get("content") or "").upper()
+                for message in messages
+            ),
             rounds=len(messages),
             elapsed_seconds=elapsed,
             files=collect_files(self.settings.paths),
@@ -393,8 +459,25 @@ class Office:
         return ""
 
 
-def build_office(settings: Settings) -> Office:
-    """Rakit 6 bot, Creator, dan GroupChat dengan tool yang sudah terpasang."""
+def build_office(
+    settings: Settings,
+    *,
+    stage: str = "full",
+    memory_context: str = "",
+) -> Office:
+    """Rakit 6 bot, Creator, dan GroupChat dengan tool yang sudah terpasang.
+
+    ``stage`` menentukan graf pembicara & pesan kickoff:
+
+    * ``"full"``       — satu rapat panjang (CLI interaktif/rehearsal);
+    * ``"ideation"``   — Vito → Clara → Damon → Bima, berhenti saat menagih rekaman;
+    * ``"production"`` — Raka → Damon → Sora, dipakai daemon setelah file muncul.
+
+    ``memory_context`` (dari :class:`studio.memory.MemoryStore`) disuntikkan ke
+    system prompt Vito & Sora saja.
+    """
+    if stage not in STAGES:
+        raise ValueError(f"stage '{stage}' tidak dikenal; pilih salah satu dari {STAGES}")
     from .tools import StudioTools  # import lokal agar modul ini ringan
 
     settings.paths.ensure()
@@ -413,6 +496,8 @@ def build_office(settings: Settings) -> Office:
             tools=spec.tools,
             handoff=spec.handoff,
         )
+        if memory_context and spec.key in {"vito", "sora"}:
+            system_message += "\n" + memory_context.strip() + "\n"
         agents[spec.key] = ConversableAgent(
             name=spec.name,
             system_message=system_message,
@@ -449,7 +534,7 @@ def build_office(settings: Settings) -> Office:
         agents=[creator, *(agents[spec.key] for spec in AGENT_SPECS)],
         messages=[],
         max_round=settings.max_rounds,
-        allowed_or_disallowed_speaker_transitions=build_transitions(agents, creator),
+        allowed_or_disallowed_speaker_transitions=build_transitions(agents, creator, stage),
         speaker_transitions_type="allowed",
         speaker_selection_method=continuation_selector,
         send_introductions=True,
@@ -469,4 +554,5 @@ def build_office(settings: Settings) -> Office:
         group_chat=group_chat,
         manager=manager,
         persona_sources=persona_sources,
+        stage=stage,
     )

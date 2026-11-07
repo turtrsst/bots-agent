@@ -47,7 +47,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-rounds", type=int, help="Batas putaran group chat (default 40).")
     parser.add_argument("--mock-creator", action="store_true", help="Buat file A-Roll dummy otomatis.")
     parser.add_argument("--real-render", action="store_true", help="Pakai ffmpeg asli (bukan file dummy).")
-    parser.add_argument("--doctor", action="store_true", help="Cek konfigurasi lalu keluar.")
+    parser.add_argument("--doctor", action="store_true", help="Cek konfigurasi + kapabilitas media lalu keluar.")
+    parser.add_argument("--status", action="store_true", help="Tampilkan antrean daemon + memori lalu keluar.")
+    parser.add_argument(
+        "--daemon",
+        action="store_true",
+        help="Jalankan 24/7: scheduler (STUDIO_SCHEDULE), file watcher input_creator/, notifikasi Telegram.",
+    )
+    parser.add_argument("--serve", action="store_true", help="Jalankan bridge HTTP untuk webhook n100n.")
+    parser.add_argument("--host", default="0.0.0.0", help="Host HTTP bridge (default 0.0.0.0).")
+    parser.add_argument("--port", type=int, default=8100, help="Port HTTP bridge (default 8100).")
+    parser.add_argument("--schedule", help="Override jadwal ideasi, contoh: '07:00,16:00'.")
     return parser.parse_args(argv)
 
 
@@ -112,13 +122,46 @@ def doctor(settings) -> int:
         print("  google api    : tersedia")
     except ImportError:
         print("  google api    : tidak ada (upload YouTube akan simulasi)")
-    import shutil
+    from studio.daemon import parse_schedule
+    from studio.media import detect_capabilities
+    from studio.memory import MemoryStore
 
-    print(f"  ffmpeg        : {shutil.which('ffmpeg') or 'tidak ada (render simulasi)'}")
+    caps = detect_capabilities(settings)
+    print(f"  ffmpeg        : {caps.ffmpeg or 'tidak ada (render hanya simulasi)'}")
+    print(f"  ffprobe       : {caps.ffprobe or 'tidak ada'}")
+    print(f"  auto-editor   : {caps.auto_editor or 'tidak ada (potong jeda dilewati)'}")
+    print(f"  whisper       : {'tersedia' if caps.whisper else 'tidak ada (subtitle dilewati)'}")
+    print(f"  remotion      : {'siap' if (caps.npx and settings.remotion_dir) else 'tidak siap'}")
+    print(f"  real render   : {'AKTIF' if settings.real_render else 'nonaktif (output simulasi)'}")
+    print(f"  async gate    : {'AKTIF (tanpa input terminal)' if settings.async_gate else 'nonaktif (interaktif)'}")
+    print(f"  jadwal ideasi : {settings.schedule or 'nonaktif'}")
+    print(f"  notifikasi    : {'telegram' if settings.telegram_token and settings.telegram_chat_id else 'konsol'}")
     print(f"  client_secret : {'ada' if (settings.paths.root / 'client_secret.json').exists() else 'tidak ada (upload simulasi)'}")
+    try:
+        stats = MemoryStore(settings.memory_db_path).stats()
+        print(f"  memori        : {stats['runs']} rapat, {stats['videos']} video ({stats['db']})")
+    except Exception as exc:  # noqa: BLE001 - doctor tidak boleh crash
+        print(f"  memori        : GAGAL dibuka ({type(exc).__name__}: {exc})")
+    if parse_schedule(settings.schedule) and not settings.api_key:
+        print("  catatan       : jadwal aktif tetapi API key kosong → job akan gagal, isi .env")
     if not settings.api_key:
         print("\n⚠️  API key belum diset — mode LLM tidak bisa jalan, pakai --rehearsal.")
     return 0 if ok else 1
+
+
+def print_status(settings) -> int:
+    from studio.daemon import Daemon
+
+    daemon = Daemon(settings)
+    print(daemon.status_text())
+    runs = daemon.memory.recent_runs(5)
+    if runs:
+        print("\n🧠 Rapat terakhir:")
+        for run in runs:
+            print(f"  - {run['created_at'][:16]} | {run['status']:<26} | {run['topic'][:70]}")
+    else:
+        print("\n🧠 Memori masih kosong — belum ada rapat yang tercatat.")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -135,10 +178,17 @@ def main(argv: list[str] | None = None) -> int:
         mock_creator=args.mock_creator or None,
         real_render=args.real_render or None,
     )
+    if args.schedule is not None:
+        settings = settings.with_changes(schedule=args.schedule)
     settings.paths.ensure()
 
     if args.doctor:
         return doctor(settings)
+    if args.status:
+        return print_status(settings)
+
+    if args.daemon or args.serve:
+        return run_long_lived(settings, args)
 
     topic = args.topic or prompt_topic()
     print_banner(settings, args.rehearsal)
@@ -178,6 +228,42 @@ def main(argv: list[str] | None = None) -> int:
     if not summary.completed:
         print("⚠️  Rapat berhenti sebelum PIPELINE_COMPLETE. Cek transkrip untuk melihat titik macetnya.\n")
         return 1
+    return 0
+
+
+def run_long_lived(settings, args) -> int:
+    """Mode 24/7: daemon scheduler/watcher atau bridge HTTP untuk n100n."""
+    import asyncio
+
+    from studio.daemon import Daemon
+
+    # Di mode daemon tidak ada terminal: jangan pernah menunggu input().
+    settings = settings.with_changes(async_gate=True)
+    daemon = Daemon(settings)
+    print_banner(settings, rehearsal=False)
+    print(daemon.status_text() + "\n")
+
+    if args.topic:
+        job = daemon.submit_ideation(args.topic, source="cli")
+        print(f"🧠 Job ideasi awal diantrekan: {job.id}\n")
+
+    if args.serve:
+        from studio.api import run_server
+
+        print(f"🌐 Bridge HTTP di http://{args.host}:{args.port}  → POST /kra/n100n-trigger\n")
+        try:
+            run_server(daemon, args.host, args.port)
+        except KeyboardInterrupt:
+            print("\n⏹️  Bridge dihentikan.")
+            return 130
+        return 0
+
+    print("🤖 Daemon jalan. Ctrl-C untuk berhenti. Semua kabar dikirim lewat notifikasi.\n")
+    try:
+        asyncio.run(daemon.run_forever())
+    except KeyboardInterrupt:
+        print("\n⏹️  Daemon dihentikan manual.")
+        return 130
     return 0
 
 

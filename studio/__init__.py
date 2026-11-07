@@ -8,7 +8,18 @@ Modul ini sengaja dipisah dari ``virtual_office_superbots.py`` supaya:
 """
 
 from .config import Settings, StudioPaths
+from .daemon import Daemon, Job
+from .memory import MemoryStore
 from .office import Office, build_office, kickoff_message
 
-__all__ = ["Settings", "StudioPaths", "Office", "build_office", "kickoff_message"]
-__version__ = "1.0.0"
+__all__ = [
+    "Daemon",
+    "Job",
+    "MemoryStore",
+    "Office",
+    "Settings",
+    "StudioPaths",
+    "build_office",
+    "kickoff_message",
+]
+__version__ = "2.0.0"

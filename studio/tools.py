@@ -1,10 +1,15 @@
-"""Tool nyata yang dieksekusi para Super Bot.
+"""Tool nyata yang dieksekusi para Super Bot (7 tool, satu pemilik per tool).
 
 Semua tool mengembalikan **string** (AutoGen meneruskan hasilnya ke LLM) dan
-selalu jujur soal apa yang benar-benar terjadi di disk:
+selalu jujur soal apa yang benar-benar terjadi:
 
-* render memakai ffmpeg asli bila ``STUDIO_REAL_RENDER=1``, kalau tidak hasilnya
-  ditandai ``simulation`` di sidecar report — Damon bisa membedakannya;
+* ``research_current_trends`` memanggil YouTube Data API / Tavily / SerpAPI; tanpa
+  kredensial ia mengatakan "RISET TIDAK TERSEDIA", bukan mengarang angka tren;
+* render memakai pipeline ffmpeg/auto-editor/Whisper/Remotion bila
+  ``STUDIO_REAL_RENDER=1``, kalau tidak hasilnya ditandai ``simulation`` di sidecar
+  report — Damon bisa membedakannya dan menolak simulasi di mode produksi;
+* ``request_and_check_creator_files`` bisa berjalan non-blocking
+  (``STUDIO_ASYNC_GATE``) untuk mode daemon: Creator dikabari lewat Telegram;
 * upload memakai YouTube Data API v3 asli bila ``client_secret.json`` tersedia,
   kalau tidak hanya menulis receipt simulasi.
 
@@ -17,8 +22,6 @@ import functools
 import hashlib
 import json
 import os
-import shutil
-import subprocess
 import sys
 import time
 from collections.abc import Callable
@@ -27,6 +30,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 from .config import Settings, env_flag
+from .media import MediaError, MediaPipeline, detect_capabilities
 
 SIMULATION_MARKER = b"STUDIO_SIMULATED_MP4"
 TODO_FILENAME = "creator_todo_list.md"
@@ -36,6 +40,7 @@ RECEIPT_FILENAME = "youtube_publish_receipt.json"
 # memiliki fungsi tersebut (func_call_filter); kalau dua bot berbagi nama fungsi
 # yang sama, eksekusi bisa mendarat di bot yang salah.
 TOOL_NAMES: tuple[str, ...] = (
+    "research_current_trends",
     "save_content_brief",
     "save_production_script",
     "request_and_check_creator_files",
@@ -68,6 +73,14 @@ class StudioTools:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.paths = settings.paths.ensure()
+        self._caps = None
+
+    @property
+    def capabilities(self):
+        """Deteksi ffmpeg/auto-editor/whisper sekali per instance."""
+        if self._caps is None:
+            self._caps = detect_capabilities(self.settings)
+        return self._caps
 
     def build_functions(self) -> dict[str, Callable[..., str]]:
         """Fungsi yang diekspos ke LLM, lengkap dengan schema ``Annotated``.
@@ -101,6 +114,7 @@ class StudioTools:
             "save_production_script": save_production_script,
         }
         for name in (
+            "research_current_trends",
             "request_and_check_creator_files",
             "assemble_and_render_video",
             "inspect_rendered_output",
@@ -168,6 +182,43 @@ class StudioTools:
             "Isi file sudah final di disk."
         )
 
+    # -------------------------------------------- 1b. riset tren nyata (Vito)
+    def research_current_trends(
+        self,
+        topic: Annotated[
+            str, "Topik/niche yang ingin dicek trennya; kosongkan untuk tren YouTube hari ini"
+        ] = "",
+    ) -> str:
+        from .research import fetch_trends
+
+        result = fetch_trends(self.settings, topic)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        artifact = self.paths.workspace / f"trend_research_{stamp}.json"
+        artifact.write_text(
+            json.dumps(result.as_dict(), indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        self._log(
+            "research",
+            provider=result.provider,
+            items=len(result.items),
+            real=result.real,
+            file=self._rel(artifact),
+        )
+
+        if not result.real:
+            return (
+                "RISET TIDAK TERSEDIA (jangan mengarang angka tren): "
+                f"{result.warning} Data mentah: ./{self._rel(artifact)}. "
+                "Tulis brief dari pengalaman dan tandai bagian tren sebagai 'tanpa data real-time'."
+            )
+        return (
+            f"TREN NYATA (provider={result.provider}, diambil {result.fetched_at}, "
+            f"{len(result.items)} hasil):\n{result.as_text()}\n\n"
+            f"Data mentah: ./{self._rel(artifact)}\n"
+            "Pakai judul/angle di atas sebagai acuan dan sebutkan angkanya apa adanya; "
+            "jangan mengarang statistik lain."
+        )
+
     # -------------------------------------------- 2. human-in-the-loop (Bima)
     def request_and_check_creator_files(
         self,
@@ -196,6 +247,18 @@ class StudioTools:
             encoding="utf-8",
         )
         self._log("request_creator_files", file=self._rel(target))
+
+        if self.settings.async_gate:
+            if target.exists() and target.stat().st_size > 0:
+                return (
+                    f"STATUS UPLOADED: '{target.name}' sudah ada di ./input_creator/ "
+                    f"({_fmt_bytes(target.stat().st_size)}). Pipeline produksi boleh dijalankan."
+                )
+            return (
+                f"STATUS AWAITING: '{target.name}' belum ada. Instruksi sudah ditulis ke "
+                f"./workspace/{TODO_FILENAME} dan akan dikirim ke Creator lewat notifikasi. "
+                "Akhiri rapat sekarang dengan kata kunci AWAITING_CREATOR_UPLOAD."
+            )
 
         if self.settings.mock_creator or env_flag("STUDIO_MOCK_CREATOR"):
             return self._mock_creator_file(target, reason="STUDIO_MOCK_CREATOR aktif")
@@ -268,6 +331,8 @@ class StudioTools:
         self,
         raw_video_filename: Annotated[str, "Nama file mentah Creator di ./input_creator/ (contoh: a_roll_raw.mp4)"],
         output_filename: Annotated[str, "Nama file hasil render di ./output_ready/ (contoh: final_render.mp4)"],
+        hook_title: Annotated[str, "Teks judul/hook untuk intro Remotion (opsional, boleh kosong)"] = "",
+        remotion_composition: Annotated[str, "ID composition Remotion di repo KRA (opsional, kosongkan bila tidak dipakai)"] = "",
     ) -> str:
         try:
             source = self._safe_path(self.paths.input_creator, raw_video_filename)
@@ -281,101 +346,93 @@ class StudioTools:
             return f"ERROR RENDER: input '{self._rel(source)}' 0 byte (korup)."
 
         target.parent.mkdir(parents=True, exist_ok=True)
-        ffmpeg = shutil.which("ffmpeg")
-        engine = "simulation"
-        notes: list[str] = []
         started = time.monotonic()
+        dummy_input = SIMULATION_MARKER in source.read_bytes()[:64]
+        caps = self.capabilities
 
-        if self.settings.real_render and ffmpeg and SIMULATION_MARKER not in source.read_bytes()[:64]:
-            engine = "ffmpeg"
-            result = self._run_ffmpeg(ffmpeg, source, target)
-            if result is not None:
-                notes.append(result)
-                engine = "simulation" if SIMULATION_MARKER in target.read_bytes()[:64] else "ffmpeg"
-        else:
-            if self.settings.real_render and ffmpeg:
-                notes.append("input adalah file dummy simulasi; ffmpeg tidak dijalankan")
-            elif not self.settings.real_render:
-                notes.append("STUDIO_REAL_RENDER tidak aktif; output dummy")
-            else:
-                notes.append("ffmpeg tidak tersedia di PATH; output dummy")
+        if self.settings.real_render and not dummy_input:
+            if not caps.can_render:
+                return (
+                    "ERROR RENDER: STUDIO_REAL_RENDER aktif tetapi ffmpeg tidak ditemukan di PATH "
+                    f"({caps.summary()}). Render tidak dijalankan."
+                )
+            self._banner(
+                "RAKA MERENDER VIDEO (FFMPEG)",
+                [
+                    f"input  : ./{self._rel(source)}",
+                    f"output : ./{self._rel(target)}",
+                    f"engine : {caps.summary()}",
+                ],
+            )
+            pipeline = MediaPipeline(self.settings, caps)
+            try:
+                result = pipeline.render(
+                    source,
+                    target,
+                    hook_title=hook_title,
+                    remotion_composition=remotion_composition,
+                )
+            except MediaError as exc:
+                self._log("render", file=self._rel(target), engine="ffmpeg", status="error", error=str(exc))
+                return f"ERROR RENDER: {exc}"
 
-        if not target.exists() or target.stat().st_size == 0:
-            target.write_bytes(SIMULATION_MARKER + b"|" + source.read_bytes()[: 2 * 1024 * 1024])
-            engine = "simulation"
+            report = result.as_dict()
+            report.update(
+                {
+                    "file": self._rel(target),
+                    "source": self._rel(source),
+                    "source_bytes": source.stat().st_size,
+                    "sha256": self._sha256(target),
+                    "rendered_at": _now(),
+                    "target_spec": {
+                        "resolution": f"{pipeline.width}x{pipeline.height}",
+                        "fps": pipeline.fps,
+                        "audio_lufs": -14.0,
+                    },
+                }
+            )
+            self._write_sidecar(target, report)
+            self._log(
+                "render",
+                file=self._rel(target),
+                engine="ffmpeg",
+                bytes=target.stat().st_size,
+                steps=[step.name for step in result.steps if step.status == "ok"],
+                failed=[step.name for step in result.steps if step.status == "failed"],
+            )
+            return f"RENDER FISIK SELESAI: {json.dumps(report, ensure_ascii=False)}"
 
-        probe = self._probe_media(target) if engine == "ffmpeg" else {}
-        report: dict[str, Any] = {
+        notes: list[str] = []
+        if self.settings.real_render and dummy_input:
+            notes.append("input adalah file dummy simulasi; ffmpeg tidak dijalankan")
+        elif not self.settings.real_render:
+            notes.append("STUDIO_REAL_RENDER tidak aktif; output dummy")
+        if self.settings.real_render and not caps.can_render:
+            notes.append("ffmpeg tidak tersedia di PATH; output dummy")
+
+        target.write_bytes(SIMULATION_MARKER + b"|" + source.read_bytes()[: 2 * 1024 * 1024])
+        report = {
             "file": self._rel(target),
-            "engine": engine,
+            "engine": "simulation",
             "source": self._rel(source),
             "source_bytes": source.stat().st_size,
             "output_bytes": target.stat().st_size,
             "sha256": self._sha256(target),
             "rendered_at": _now(),
             "elapsed_seconds": round(time.monotonic() - started, 2),
-            "target_spec": {"resolution": "1920x1080", "fps": 60, "audio_lufs": -14.0},
-            "audio_normalized": engine == "ffmpeg",
+            "target_spec": {"resolution": "1920x1080", "fps": self.settings.render_fps, "audio_lufs": -14.0},
+            "audio_normalized": False,
             "thumbnails": [],
             "notes": notes,
         }
-        report.update(probe)
+        self._write_sidecar(target, report)
+        self._log("render", file=self._rel(target), engine="simulation", bytes=target.stat().st_size)
+        return f"RENDER SELESAI (SIMULASI): {json.dumps(report, ensure_ascii=False)}"
+
+    def _write_sidecar(self, target: Path, report: dict[str, Any]) -> Path:
         sidecar = target.with_name(target.stem + ".render.json")
         sidecar.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-        self._log("render", file=self._rel(target), engine=engine, bytes=target.stat().st_size)
-
-        verdict = "RENDER SELESAI" if engine == "ffmpeg" else "RENDER SELESAI (SIMULASI)"
-        return f"{verdict}: {json.dumps(report, ensure_ascii=False)}"
-
-    def _run_ffmpeg(self, ffmpeg: str, source: Path, target: Path) -> str | None:
-        """Render 1080p60 + loudnorm -14 LUFS. Kembalikan catatan bila audio gagal."""
-        base_cmd = [
-            ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-            "-i", str(source),
-            "-vf", "scale=1920:-2:flags=lanczos,fps=60",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
-        ]
-        with_audio = base_cmd + [
-            "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",
-            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(target),
-        ]
-        proc = subprocess.run(with_audio, capture_output=True, text=True)
-        if proc.returncode == 0:
-            return None
-
-        without_audio = base_cmd + ["-an", "-movflags", "+faststart", str(target)]
-        retry = subprocess.run(without_audio, capture_output=True, text=True)
-        if retry.returncode == 0:
-            return f"input tanpa audio valid; render ulang tanpa audio ({_short(proc.stderr, 200)})"
-        return f"ffmpeg gagal (exit {retry.returncode}): {_short(retry.stderr)}"
-
-    def _probe_media(self, path: Path) -> dict[str, Any]:
-        ffprobe = shutil.which("ffprobe")
-        if not ffprobe or not path.exists():
-            return {}
-        cmd = [
-            ffprobe, "-v", "error", "-print_format", "json",
-            "-show_format", "-show_streams", str(path),
-        ]
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-            if proc.returncode != 0:
-                return {}
-            data = json.loads(proc.stdout or "{}")
-        except (subprocess.SubprocessError, json.JSONDecodeError):
-            return {}
-        video = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), {})
-        audio = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), {})
-        return {
-            "probe": {
-                "duration_s": round(float(data.get("format", {}).get("duration", 0.0) or 0.0), 2),
-                "width": video.get("width"),
-                "height": video.get("height"),
-                "fps": video.get("r_frame_rate"),
-                "video_codec": video.get("codec_name"),
-                "audio_codec": audio.get("codec_name"),
-            }
-        }
+        return sidecar
 
     # ------------------------------------------------------ 4. audit (Damon)
     def inspect_rendered_output(
@@ -429,6 +486,13 @@ class StudioTools:
         if problems:
             self._log("audit_video", verdict="FAIL", problems=problems)
             return f"AUDIT GAGAL: {'; '.join(problems)}. BUKTI: {json.dumps(evidence, ensure_ascii=False)}"
+
+        if simulated and self.settings.real_render:
+            self._log("audit_video", verdict="FAIL", problems=["simulation_in_production_mode"])
+            return (
+                "AUDIT GAGAL: mode real render aktif, tetapi output ini artefak SIMULASI "
+                "(bukan hasil ffmpeg). Jalankan render ulang dengan file asli."
+            )
 
         warning = (
             " Catatan: ini artefak SIMULASI (bukan rekaman asli), pipeline tetap boleh lanjut untuk uji alur."

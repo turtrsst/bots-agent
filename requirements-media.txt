@@ -1,0 +1,12 @@
+# Ekstra untuk "tangan" Raka di jalur produksi nyata.
+# Tanpa paket ini pipeline tetap jalan, tetapi langkahnya DILEWATI dan
+# dilaporkan jujur di sidecar .render.json (bukan diklaim berhasil).
+
+# Subtitle otomatis (word-level, bahasa Indonesia)
+openai-whisper>=20231117
+
+# Catatan instalasi di luar pip:
+#   ffmpeg + ffprobe  -> wajib untuk render nyata (apt install ffmpeg / brew install ffmpeg)
+#   auto-editor       -> potong jeda otomatis (pip install auto-editor)
+#   remotion (npx)    -> intro/B-roll: npm i lalu `npx remotion render <composition>`,
+#                        set STUDIO_REMOTION_DIR ke repo Remotion KRA.

@@ -7,7 +7,8 @@ import pytest
 from studio.config import Settings, StudioPaths
 from studio.office import (
     AGENT_SPECS,
-    TERMINATION_KEYWORD,
+    STAGES,
+    TERMINATION_KEYWORDS,
     build_office,
     build_transitions,
     continuation_selector,
@@ -85,9 +86,11 @@ def test_group_chat_uses_transitions_and_introductions(office) -> None:
     assert office.group_chat.max_round == office.settings.max_rounds
 
 
-def test_termination_keyword_is_wired(office) -> None:
-    assert TERMINATION_KEYWORD == "PIPELINE_COMPLETE"
+def test_termination_keywords_are_wired(office) -> None:
+    assert "PIPELINE_COMPLETE" in TERMINATION_KEYWORDS
+    assert "AWAITING_CREATOR_UPLOAD" in TERMINATION_KEYWORDS
     assert office.manager._is_termination_msg({"content": "selesai. pipeline_complete"})
+    assert office.manager._is_termination_msg({"content": "... awaiting_creator_upload"})
     assert not office.manager._is_termination_msg({"content": "belum selesai"})
 
 
@@ -99,7 +102,29 @@ def test_kickoff_message_mentions_topic_and_all_steps() -> None:
         assert name in message
     # kata kunci terminasi TIDAK boleh ada di pesan pembuka, kalau tidak rapat
     # langsung ditutup sebelum Vito sempat bicara
-    assert TERMINATION_KEYWORD not in message
+    for keyword in TERMINATION_KEYWORDS:
+        assert keyword not in message
+
+
+def test_kickoff_messages_never_contain_termination_keywords() -> None:
+    for stage in STAGES:
+        message = kickoff_message("Topik uji", stage=stage, raw_file="a_roll_raw.mp4")
+        for keyword in TERMINATION_KEYWORDS:
+            assert keyword not in message, f"stage {stage} membocorkan {keyword}"
+
+
+def test_stage_specific_transitions(office) -> None:
+    ideation = build_transitions(office.agents, office.creator, "ideation")
+    assert office.agents["vito"] in ideation[office.creator]
+    assert office.agents["bima"] not in ideation  # sink: rapat berhenti setelah menagih file
+    production = build_transitions(office.agents, office.creator, "production")
+    assert production[office.creator] == [office.agents["raka"]]
+    assert office.agents["sora"] in production[office.agents["damon"]]
+
+
+def test_build_office_rejects_unknown_stage(settings) -> None:
+    with pytest.raises(ValueError, match="stage"):
+        build_office(settings, stage="ngawur")
 
 
 def test_build_office_requires_api_key(studio_root) -> None:
