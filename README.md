@@ -71,6 +71,8 @@ Keluaran ada di `workspace/`, `input_creator/`, `output_ready/`:
 |---|---|
 | `workspace/content_brief.json` | brief Vito (judul, thumbnail, angle) |
 | `workspace/script_production.md` | naskah Clara, ditandai `[CREATOR A-ROLL]` / `[AI B-ROLL]` |
+| `workspace/script_production.json` | scene breakdown mesin (dibaca Remotion + concat) |
+| `workspace/props_*.json` | props per scene yang dikirim ke Remotion (bisa diperiksa manual) |
 | `workspace/creator_todo_list.md` | instruksi rekaman dari Bima ke Anda |
 | `workspace/run_transcript.md` | transkrip rapat + daftar berkas |
 | `workspace/studio_log.jsonl` | log audit setiap tool |
@@ -89,10 +91,10 @@ Setiap bot memegang **hanya** tool sesuai perannya. Tool yang sama tidak dibagi 
 |---|---|---|---|
 | `Creator_Kamu` | Anda (manusia) | — | Vito |
 | `Vito_TrendStrategist` | riset tren **nyata**, judul, thumbnail | `research_current_trends`, `save_content_brief` | Clara |
-| `Clara_Scriptwriter` | naskah retensi tinggi, A-Roll/B-Roll | `save_production_script` | Damon |
+| `Clara_Scriptwriter` | naskah retensi tinggi, A-Roll/B-Roll | `save_production_script`, `save_scene_breakdown` | Damon |
 | `Damon_RealityChecker` | QC + hak veto (2 gerbang) | `inspect_rendered_output` | Clara / Bima / Raka / Sora |
 | `Bima_StudioPM` | gatekeeper human-in-the-loop | `request_and_check_creator_files` | Raka |
-| `Raka_Producer` | render ffmpeg 1080p60 | `assemble_and_render_video` | Damon |
+| `Raka_Producer` | render ffmpeg 1080p60 / Remotion per scene | `assemble_and_render_video`, `assemble_story_from_script` | Damon |
 | `Sora_YouTubePublisher` | SEO + upload YouTube | `upload_to_youtube` | — (menutup rapat) |
 
 Persona tiap bot adalah file Markdown di [`agents/`](agents) (gaya
@@ -240,6 +242,81 @@ pip install -r requirements-media.txt   # auto-editor + openai-whisper
 
 Damon mengaudit hasil lewat `inspect_rendered_output`: file ada, bukan 0 byte,
 header MP4 valid, side-car ada, SHA-256 cocok, dan resolusi ≥ 1080p (dari `ffprobe`).
+
+---
+
+### 5b. Naskah JSON → Remotion → concat (jembatan seragam)
+
+Naskah Markdown enak dibaca manusia, tetapi Remotion butuh **data**. Karena itu Clara
+menyimpan dua artefak dari materi yang sama:
+
+| Artefak | Untuk siapa |
+|---|---|
+| `workspace/script_production.md` | Creator (merekam) & Damon (audit naratif) |
+| `workspace/script_production.json` | mesin: Remotion + modul concat |
+
+```json
+{
+  "project_id": "story_kra_001",
+  "title": "Rahasia di Balik Kantor AI Otonom",
+  "fps": 30,
+  "scenes": [
+    {
+      "scene_id": "scene_1_hook",
+      "type": "REMOTION_DYNAMIC",
+      "composition_id": "StoryScene",
+      "narration_text": "Pernahkah kamu membayangkan kantor yang berjalan sendiri saat kamu tidur?",
+      "visual_cue": "Dark futuristic server room with glowing neon nodes",
+      "broll_asset": "broll_server.mp4",
+      "highlight_words": ["berjalan sendiri", "tidur"]
+    },
+    {
+      "scene_id": "scene_2_aroll",
+      "type": "CREATOR_AROLL",
+      "composition_id": "CreatorOverlay",
+      "source_video": "a_roll_raw.mp4",
+      "lower_third_text": "Rama - Founder KRA",
+      "narration_text": "Ini yang terjadi tiap pagi di kantor kami."
+    }
+  ]
+}
+```
+
+Tool Clara memvalidasi skema ini (`studio/story.py::validate_story`) dan membalas
+`ERROR SCHEMA`/`ERROR JSON` bila ada yang kurang — bukan menyimpan diam-diam.
+
+Raka lalu memanggil:
+
+```python
+assemble_story_from_script("script_production.json", "final_render.mp4")
+```
+
+Yang terjadi per scene (semua tercatat di `.render.json`):
+
+| Tahap | Detail |
+|---|---|
+| Whisper | `word_timestamps=True` → `[{word, start, end}]`; `durationInSeconds = max(end)` |
+| Stage aset | file disalin ke `remotion_studio/public/kra_temp/` — Chromium Remotion menolak `file://`, ini yang membuat `staticFile()` aman |
+| Render | `npx remotion render <composition_id> out.mp4 --props=workspace/props_<nn>_<scene>.json` |
+| Concat | `npx ffmpeg-concat -t directionalWarp` (via `xvfb-run` bila headless), fallback demuxer ffmpeg dengan `-c copy` |
+| Bersih | `public/kra_temp/` dikosongkan setelah selesai |
+
+Dua masalah klasik ikut diselesaikan:
+
+* **blokir `file://`** — aset selalu lewat `public/kra_temp/` + `staticFile()`;
+* **durasi statis** — `calculateMetadata` di `Root.tsx` mengubah `durationInSeconds`
+  (hasil Whisper) menjadi `durationInFrames`, jadi scene sepanjang apa pun audionya
+  tidak terpotong atau membeku di ujung.
+
+Template komponennya ada di [`remotion_template/`](remotion_template) —
+`Root.tsx` (composition `StoryScene` **dan** `CreatorOverlay`) dan `StoryScene.tsx`
+(caption per kata, highlight dari Clara, lower third, tahan kata terakhir 0.25 s agar
+caption tidak berkedip). Salin ke `remotion_studio/src/`, lalu set
+`STUDIO_REMOTION_DIR`.
+
+Bila Node/Remotion belum siap, setiap scene tetap dirender dengan FFmpeg
+(conform 1080p + burn-in SRT) dan laporan menyebut `engine: "ffmpeg-fallback"` —
+Raka wajib mengatakannya di ruang rapat, bukan mengaku sudah memakai Remotion.
 
 ---
 
@@ -435,6 +512,7 @@ studio/
   tools.py                    # 7 tool nyata (riset, filesystem, media, YouTube)
   office.py                   # spesifikasi bot, graf transisi per fase, GroupChat
   media.py                    # pipeline ffmpeg/auto-editor/Whisper/Remotion + ffprobe
+  story.py                    # jembatan JSON: naskah Clara → Whisper → Remotion → concat
   research.py                 # tren nyata: YouTube Data API, Tavily, SerpAPI
   memory.py                   # SQLite: runs, videos, topics, prompt_context()
   notify.py                   # Telegram Bot API (urllib) + konsol
@@ -443,7 +521,8 @@ studio/
   report.py                   # transkrip & ringkasan run
   rehearsal.py                # pipeline deterministik tanpa LLM
 agents/*.md                   # persona 6 bot
-tests/                        # 83 test: unit, daemon, API, e2e GroupChat dengan LLM palsu
+remotion_template/            # Root.tsx + StoryScene.tsx untuk kantor-rama-ai/remotion_studio
+tests/                        # 103 test: unit, daemon, API, story, e2e GroupChat dengan LLM palsu
 requirements-daemon.txt       # fastapi + uvicorn (mode --serve)
 requirements-media.txt        # openai-whisper (+ catatan ffmpeg/auto-editor/remotion)
 ```
@@ -478,7 +557,7 @@ tetap macet, `max_round` menghentikannya dan laporan berstatus
 
 ```bash
 pip install -r requirements-dev.txt
-pytest            # 83 test
+pytest            # 103 test
 ruff check .
 ```
 
@@ -490,6 +569,7 @@ ruff check .
 - `tests/test_daemon.py` — jadwal, watcher (file muncul sekali), antrean job, resume, perintah Telegram, shutdown.
 - `tests/test_api.py` — webhook n100n: 202, 409, 422, sanitasi path.
 - `tests/test_research.py` — parsing YouTube/Tavily, fallback antar-provider, dan perilaku jujur tanpa kredensial.
+- `tests/test_story.py` — validasi skema naskah, ekstraksi kata Whisper, staging `kra_temp`, render Remotion (npx palsu), concat, dan fallback FFmpeg.
 - `tests/test_group_chat_e2e.py` — **GroupChat sungguhan** dengan `OpenAIWrapper.create`
   yang dipalsukan: membuktikan tool dieksekusi oleh bot yang tepat, loop
   Damon-menolak-Clara berjalan, dan rapat berhenti karena `PIPELINE_COMPLETE`, bukan
@@ -517,6 +597,10 @@ dijawab deterministik, tetapi seluruh mesin AutoGen tetap berjalan.
 | `webhook 409` | File `raw_video_filename` belum ada/0 byte di `input_creator/` — tunggu copy selesai |
 | `RISET TIDAK TERSEDIA` | Isi `STUDIO_YOUTUBE_API_KEY` (cukup API key) atau Tavily/SerpAPI. Vito dilarang mengarang tren |
 | Subtitle tidak ada / `whisper: failed` | `pip install -r requirements-media.txt`; cek `steps` di `.render.json` |
+| Clara dapat `ERROR SCHEMA` | JSON scene breakdown belum sesuai kontrak (lihat §2 persona Clara / §5b); tool menyebut field yang salah |
+| `remotion gagal` di laporan scene | Cek `STUDIO_REMOTION_DIR` menunjuk repo Remotion, `npx remotion` bisa jalan, dan `composition_id` terdaftar di `Root.tsx` |
+| Video hitam / caption kosong | `words` kosong berarti Whisper tidak jalan; scene tetap dirender tanpa caption. Cek `engine` di `.render.json` |
+| `kra_temp` menumpuk | Normalnya dibersihkan setelah build; sisa file muncul hanya bila proses mati di tengah render |
 
 ---
 

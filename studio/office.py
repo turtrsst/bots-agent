@@ -38,6 +38,14 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "SerpAPI) untuk topik tertentu. Panggil sebelum menyusun brief; kalau hasilnya "
         "'RISET TIDAK TERSEDIA', jangan mengarang angka tren."
     ),
+    "save_scene_breakdown": (
+        "Simpan scene breakdown mesin (JSON) ke ./workspace/script_production.json. File ini "
+        "dibaca Remotion & modul concat; wajib diisi setelah naskah Markdown selesai."
+    ),
+    "assemble_story_from_script": (
+        "Rakit semua scene dari ./workspace/script_production.json: Whisper per scene, render "
+        "Remotion (aset disalin ke public/kra_temp), lalu concat. Jalur utama bila naskah JSON ada."
+    ),
     "save_content_brief": (
         "Simpan content brief (3 judul, thumbnail, angle, audiens, keyword) ke "
         "./workspace/content_brief.json. Panggil setelah brief selesai, jangan hanya menulis di chat."
@@ -118,7 +126,7 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
         persona_file="script-architect.md",
         description=(
             "Clara — penulis naskah retensi tinggi dengan pemisahan tegas [CREATOR A-ROLL] dan "
-            "[AI B-ROLL]. Revisi bila ditolak Damon_RealityChecker."
+            "[AI B-ROLL], plus scene breakdown JSON untuk Remotion. Revisi bila ditolak Damon."
         ),
         fallback_prompt=(
             "Kamu Clara, Retention Scriptwriter. Tulis naskah 2 kolom dari brief Vito, tandai tegas "
@@ -132,15 +140,18 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
             "3. Setiap baris naskah HARUS diawali penanda `[CREATOR A-ROLL]` (diucapkan manusia) "
             "atau `[AI B-ROLL]` (visual/b-roll). Sertakan timecode kasar.\n"
             "4. Dilarang: sapaan 'Halo guys', 'di video kali ini', intro panjang.\n"
-            "5. Panggil `save_production_script(...)` (file otomatis menjadi script_production.md), "
-            "lalu serahkan ke Damon_RealityChecker.\n"
-            "6. Bila Damon menolak, revisi dan SIMPAN ULANG file yang sama sebelum membalas."
+            "5. Panggil `save_production_script(...)` (file otomatis menjadi script_production.md).\n"
+            "6. WAJIB juga panggil `save_scene_breakdown(...)` dengan JSON scene breakdown "
+            "(project_id, title, fps, scenes[]: scene_id, type REMOTION_DYNAMIC/CREATOR_AROLL, "
+            "narration_text, broll_asset atau source_video, highlight_words). Ini yang dibaca "
+            "Remotion & concat. Kalau tool membalas ERROR SCHEMA/ERROR JSON, perbaiki lalu simpan ulang.\n"
+            "7. Baru serahkan ke Damon_RealityChecker. Bila ditolak, revisi dan SIMPAN ULANG kedua file."
         ),
         default_reply=(
-            "Damon_RealityChecker, naskah revisi saya sudah tersimpan di ./workspace/script_production.md. "
-            "Mohon audit ulang."
+            "Damon_RealityChecker, naskah revisi saya sudah tersimpan di ./workspace/script_production.md "
+            "beserta scene breakdown ./workspace/script_production.json. Mohon audit ulang."
         ),
-        tools=("save_production_script",),
+        tools=("save_production_script", "save_scene_breakdown"),
         handoff=("Damon_RealityChecker",),
     ),
     AgentSpec(
@@ -217,8 +228,8 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
         role="Media Producer / Editor otomatis",
         persona_file="media-producer.md",
         description=(
-            "Raka — editor yang merender rekaman Creator menjadi final_render.mp4 lewat tool "
-            "assemble_and_render_video, lalu menyerahkannya ke Damon untuk QC."
+            "Raka — editor yang merakit final_render.mp4 dari naskah Clara: Remotion per scene + "
+            "concat (assemble_story_from_script) atau render satu file (assemble_and_render_video)."
         ),
         fallback_prompt=(
             "Kamu Raka, Media Producer. Setelah Bima mengonfirmasi STATUS UPLOADED, jalankan "
@@ -227,15 +238,20 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
         ),
         protocol=(
             "## ALUR KERJAMU\n"
-            "1. Bekerja hanya setelah Bima menyatakan `STATUS UPLOADED`.\n"
-            "2. Panggil `assemble_and_render_video('a_roll_raw.mp4', 'final_render.mp4')`.\n"
-            "3. Laporkan hasil tool apa adanya: engine (ffmpeg/simulation), ukuran, dan catatan.\n"
-            "4. Serahkan ke Damon_RealityChecker untuk QC. Jangan mengklaim 'sudah bagus' tanpa audit."
+            "1. Bekerja hanya setelah Bima menyatakan `STATUS UPLOADED` (atau di fase produksi daemon).\n"
+            "2. Bila ./workspace/script_production.json ada, itu jalur utama: panggil "
+            "`assemble_story_from_script('script_production.json', 'final_render.mp4')` — "
+            "scene dirakit dengan Whisper + Remotion lalu digabung concat.\n"
+            "3. Bila naskah JSON belum ada, pakai `assemble_and_render_video('a_roll_raw.mp4', "
+            "'final_render.mp4')`.\n"
+            "4. Laporkan hasil tool apa adanya: engine (remotion/ffmpeg-fallback/simulation), "
+            "jumlah scene yang gagal, ukuran, dan catatan.\n"
+            "5. Serahkan ke Damon_RealityChecker untuk QC. Jangan mengklaim 'sudah bagus' tanpa audit."
         ),
         default_reply=(
             "Damon_RealityChecker, render selesai: ./output_ready/final_render.mp4. Silakan audit bukti fisiknya."
         ),
-        tools=("assemble_and_render_video",),
+        tools=("assemble_and_render_video", "assemble_story_from_script"),
         handoff=("Damon_RealityChecker",),
     ),
     AgentSpec(
@@ -278,7 +294,8 @@ def kickoff_message(topic: str, stage: str = "full", raw_file: str = "") -> str:
             "FASE IDEASI DIMULAI (belum masuk produksi).\n"
             f"Topik dari Creator: '{topic}'.\n\n"
             "1. Vito_TrendStrategist — brief + 3 judul ber-CTR tinggi → `save_content_brief`.\n"
-            "2. Clara_Scriptwriter — naskah dengan [CREATOR A-ROLL]/[AI B-ROLL] → `save_production_script`.\n"
+            "2. Clara_Scriptwriter — naskah [CREATOR A-ROLL]/[AI B-ROLL] → `save_production_script`, "
+            "lalu scene breakdown JSON → `save_scene_breakdown`.\n"
             "3. Damon_RealityChecker — audit naskah, minta revisi bila perlu, setujui bila layak.\n"
             "4. Bima_StudioPM — setelah disetujui, panggil tool untuk menagih 'a_roll_raw.mp4' ke Creator.\n\n"
             # kata kunci terminasi tidak boleh muncul di pesan kickoff
@@ -292,8 +309,9 @@ def kickoff_message(topic: str, stage: str = "full", raw_file: str = "") -> str:
             "FASE PRODUKSI DIMULAI.\n"
             f"Rekaman Creator: '{raw}' sudah tersedia di ./input_creator/.\n"
             f"Naskah & brief sudah ada di ./workspace/ dan sudah disetujui Damon.\n\n"
-            "1. Raka_Producer — panggil tool render: 'a_roll_raw.mp4' → 'final_render.mp4' "
-            "(hook_title diambil dari judul pemenang di content_brief.json).\n"
+            "1. Raka_Producer — panggil `assemble_story_from_script('script_production.json', "
+            "'final_render.mp4')` bila naskah JSON ada; kalau tidak, `assemble_and_render_video("
+            "'a_roll_raw.mp4', 'final_render.mp4')`.\n"
             "2. Damon_RealityChecker — audit bukti fisik file hasil render.\n"
             "3. Sora_YouTubePublisher — upload dengan metadata SEO + Chapters, lalu tutup rapat "
             "dengan kata kunci penutup.\n\n"
@@ -305,10 +323,12 @@ def kickoff_message(topic: str, stage: str = "full", raw_file: str = "") -> str:
         "Rapat produksi otonom, urutannya:\n"
         "1. Vito_TrendStrategist — content brief + 3 judul ber-CTR tinggi → `content_brief.json`.\n"
         "2. Clara_Scriptwriter — naskah retensi tinggi dengan [CREATOR A-ROLL]/[AI B-ROLL] → "
-        "`script_production.md`.\n"
+        "`script_production.md`, PLUS scene breakdown JSON → `script_production.json` "
+        "(dipakai Remotion & concat).\n"
         "3. Damon_RealityChecker — audit naskah. Minta revisi bila perlu, setujui bila layak produksi.\n"
         "4. Bima_StudioPM — tagih rekaman 'a_roll_raw.mp4' dari Creator lewat tool.\n"
-        "5. Raka_Producer — render 'final_render.mp4'.\n"
+        "5. Raka_Producer — rakit 'final_render.mp4': pakai `assemble_story_from_script` bila "
+        "naskah JSON ada, atau `assemble_and_render_video` untuk jalur satu file.\n"
         "6. Damon_RealityChecker — audit bukti fisik file video sebelum boleh tayang.\n"
         # JANGAN menulis kata kunci terminasi di sini: pesan kickoff ikut dibaca
         # _is_termination_msg dan akan menutup rapat di putaran pertama.

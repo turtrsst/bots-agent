@@ -31,10 +31,12 @@ from typing import Annotated, Any
 
 from .config import Settings, env_flag
 from .media import MediaError, MediaPipeline, detect_capabilities
+from .story import StoryBuilder, StoryError, validate_story
 
 SIMULATION_MARKER = b"STUDIO_SIMULATED_MP4"
 TODO_FILENAME = "creator_todo_list.md"
 RECEIPT_FILENAME = "youtube_publish_receipt.json"
+SCENE_FILENAME = "script_production.json"
 
 # Nama tool harus UNIK per bot. AutoGen merutekan pesan `tool_calls` ke agen yang
 # memiliki fungsi tersebut (func_call_filter); kalau dua bot berbagi nama fungsi
@@ -43,6 +45,8 @@ TOOL_NAMES: tuple[str, ...] = (
     "research_current_trends",
     "save_content_brief",
     "save_production_script",
+    "save_scene_breakdown",
+    "assemble_story_from_script",
     "request_and_check_creator_files",
     "assemble_and_render_video",
     "inspect_rendered_output",
@@ -115,8 +119,10 @@ class StudioTools:
         }
         for name in (
             "research_current_trends",
+            "save_scene_breakdown",
             "request_and_check_creator_files",
             "assemble_and_render_video",
+            "assemble_story_from_script",
             "inspect_rendered_output",
             "upload_to_youtube",
         ):
@@ -180,6 +186,46 @@ class StudioTools:
         return (
             f"TERSIMPAN: ./{self._rel(target)} ({_fmt_bytes(size)}, {len(content.splitlines())} baris). "
             "Isi file sudah final di disk."
+        )
+
+    # ------------------------------- 1a-bis. naskah mesin untuk Remotion (Clara)
+    def save_scene_breakdown(
+        self,
+        content: Annotated[
+            str,
+            "JSON scene breakdown lengkap (project_id, title, fps, scenes[] dengan scene_id, "
+            "type REMOTION_DYNAMIC/CREATOR_AROLL, narration_text, broll_asset/source_video, "
+            "highlight_words)",
+        ],
+    ) -> str:
+        """Validasi + simpan script_production.json yang dibaca Remotion & concat."""
+        if not (content or "").strip():
+            return "ERROR: isi scene breakdown kosong, tidak ada yang disimpan."
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError as exc:
+            return (
+                f"ERROR JSON: {exc}. Kirim objek JSON valid (bukan Markdown, bukan blok ```json)."
+            )
+
+        report = validate_story(data)
+        if not report.ok or report.script is None:
+            return (
+                "ERROR SCHEMA: " + "; ".join(report.problems) + ". Perbaiki JSON lalu simpan ulang."
+            )
+
+        target = self.paths.workspace / SCENE_FILENAME
+        target.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._log(
+            "save_scene_breakdown",
+            file=self._rel(target),
+            scenes=len(report.script.scenes),
+            fps=report.script.fps,
+        )
+        warning = f" Catatan: {'; '.join(report.warnings)}." if report.warnings else ""
+        return (
+            f"TERSIMPAN: ./{self._rel(target)} ({len(report.script.scenes)} scene, "
+            f"fps {report.script.fps}).{warning} Ini naskah mesin untuk Remotion + concat."
         )
 
     # -------------------------------------------- 1b. riset tren nyata (Vito)
@@ -377,6 +423,7 @@ class StudioTools:
                 return f"ERROR RENDER: {exc}"
 
             report = result.as_dict()
+            report["probe"] = result.specs
             report.update(
                 {
                     "file": self._rel(target),
@@ -434,6 +481,83 @@ class StudioTools:
         sidecar.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
         return sidecar
 
+    # ------------------------------- 3b. story Remotion + concat (Raka)
+    def assemble_story_from_script(
+        self,
+        script_json_filename: Annotated[
+            str, "Nama naskah JSON dari Clara di ./workspace/ (default script_production.json)"
+        ] = SCENE_FILENAME,
+        output_filename: Annotated[
+            str, "Nama file hasil di ./output_ready/ (default final_render.mp4)"
+        ] = "final_render.mp4",
+        transition_name: Annotated[
+            str, "Transisi ffmpeg-concat (directionalWarp, CrossZoom, ...); kosongkan untuk cut langsung"
+        ] = "directionalWarp",
+    ) -> str:
+        """Rakit semua scene: Whisper → Remotion per scene → concat → ffprobe."""
+        try:
+            script_path = self._safe_path(self.paths.workspace, script_json_filename)
+            target = self._safe_path(self.paths.output_ready, output_filename)
+        except ValueError as exc:
+            return f"ERROR: {exc}"
+
+        if not script_path.exists():
+            return (
+                f"ERROR RENDER: naskah mesin '{self._rel(script_path)}' belum ada. "
+                "Minta Clara menyimpan scene breakdown lebih dulu, atau pakai "
+                "assemble_and_render_video untuk jalur satu file."
+            )
+
+        caps = self.capabilities
+        if not caps.can_render:
+            return f"ERROR RENDER: ffmpeg tidak ditemukan di PATH ({caps.summary()})."
+
+        started = time.monotonic()
+        self._banner(
+            "RAKA MERAKIT STORY (REMOTION + CONCAT)",
+            [
+                f"naskah : ./{self._rel(script_path)}",
+                f"output : ./{self._rel(target)}",
+                f"engine : {caps.summary()}",
+            ],
+        )
+        builder = StoryBuilder(self.settings, caps)
+        try:
+            result = builder.build(
+                script_path,
+                target,
+                transition=transition_name.strip(),
+                fallback_source="a_roll_raw.mp4",
+            )
+        except StoryError as exc:
+            self._log("render_story", status="error", error=str(exc))
+            return f"ERROR RENDER: {exc}"
+
+        report = result.as_dict()
+        report["probe"] = result.specs
+        report.update(
+            {
+                "source_script": self._rel(script_path),
+                "sha256": self._sha256(target),
+                "rendered_at": _now(),
+                "elapsed_seconds": round(time.monotonic() - started, 2),
+                "target_spec": {
+                    "resolution": "1920x1080",
+                    "fps": result.fps,
+                    "audio_lufs": -14.0,
+                },
+            }
+        )
+        self._write_sidecar(target, report)
+        self._log(
+            "render_story",
+            file=self._rel(target),
+            engine=result.engine,
+            scenes=len(result.scenes),
+            notes=result.notes[:5],
+        )
+        return f"RENDER STORY SELESAI: {json.dumps(report, ensure_ascii=False)}"
+
     # ------------------------------------------------------ 4. audit (Damon)
     def inspect_rendered_output(
         self,
@@ -471,15 +595,15 @@ class StudioTools:
             "render_engine": report.get("engine", "unknown"),
             "simulation_artifact": simulated,
         }
-        if report.get("probe"):
-            evidence["probe"] = report["probe"]
+        probe = report.get("probe") or report.get("specs") or {}
+        if probe:
+            evidence["probe"] = probe
 
         problems: list[str] = []
         if not sidecar.exists():
             problems.append("laporan render (.render.json) tidak ditemukan")
         if not simulated and b"ftyp" not in head[:16]:
             problems.append("header bukan MP4 yang valid")
-        probe = report.get("probe") or {}
         if probe and probe.get("height") and int(probe["height"]) < 1080:
             problems.append(f"resolusi {probe.get('width')}x{probe.get('height')} di bawah 1080p")
 

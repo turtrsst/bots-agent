@@ -291,6 +291,16 @@ class MediaPipeline:
         ]
         return self._exec("cut_dead_air", cmd, out, steps, notes, fallback=source)
 
+    def transcribe(self, source: Path, transcript_path: Path) -> dict[str, Any]:
+        """Transkripsi word-level (bahasa Indonesia) + simpan JSON mentah Whisper."""
+        model = self._whisper_model()
+        result = model.transcribe(str(source), language="id", word_timestamps=True, verbose=False)
+        transcript_path.parent.mkdir(parents=True, exist_ok=True)
+        transcript_path.write_text(
+            json.dumps(result, ensure_ascii=False, default=str), encoding="utf-8"
+        )
+        return result
+
     def _step_transcribe(
         self, source: Path, steps: list[StepResult], notes: list[str]
     ) -> tuple[Path | None, Path | None]:
@@ -299,14 +309,10 @@ class MediaPipeline:
             return None, None
         started = time.monotonic()
         try:
-            model = self._whisper_model()
-            transcription = model.transcribe(str(source), language="id", word_timestamps=True, verbose=False)
+            json_path = self.workdir / "transcript.json"
+            transcription = self.transcribe(source, json_path)
             srt_path = self.workdir / "subtitles.srt"
             srt_path.write_text(segments_to_srt(transcription.get("segments", [])), encoding="utf-8")
-            json_path = self.workdir / "transcript.json"
-            json_path.write_text(
-                json.dumps(transcription, ensure_ascii=False, default=str), encoding="utf-8"
-            )
             steps.append(
                 StepResult("whisper", "ok", f"{len(transcription.get('segments', []))} segmen", time.monotonic() - started)
             )
@@ -430,6 +436,21 @@ class MediaPipeline:
             return
         detail = "subtitle burn-in" + (" + BGM" if bgm else "") if srt or bgm else "re-encode"
         steps.append(StepResult("finalize", "ok", detail, time.monotonic() - started))
+
+    # ---------------------------------------------------------------- publik
+    def probe(self, path: Path) -> dict[str, Any]:
+        """Spesifikasi file media (kosong bila ffprobe tidak tersedia)."""
+        return self._probe(Path(path))
+
+    def run(self, cmd: list[str], *, cwd: Path | None = None, timeout: int = DEFAULT_TIMEOUT):
+        """Jalankan perintah media dan naikkan MediaError bila gagal."""
+        return self._run(cmd, cwd=cwd, timeout=timeout)
+
+    def conform_clip(
+        self, source: Path, target: Path, steps: list[StepResult], notes: list[str]
+    ) -> Path:
+        """Paksa klip menjadi 1080p/fps audio stereo yang seragam (siap concat)."""
+        return self._conform(Path(source), Path(target), steps, notes)
 
     # -------------------------------------------------------------- konform
     def _conform(

@@ -63,3 +63,31 @@ class RecordingNotifier:
 @pytest.fixture
 def notifier() -> RecordingNotifier:
     return RecordingNotifier()
+
+
+@pytest.fixture
+def fake_npx(tmp_path: Path) -> Path:
+    """Binary npx palsu untuk `remotion render` dan `ffmpeg-concat`."""
+    script = tmp_path / "bin" / "npx"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text(
+        "#!/bin/sh\n"
+        "while [ \"$1\" = '--yes' ]; do shift; done\n"
+        "out=''\n"
+        "if [ \"$1\" = 'remotion' ]; then out=\"$4\"; else\n"
+        "  prev=''; for a in \"$@\"; do [ \"$prev\" = '-o' ] && out=\"$a\"; prev=\"$a\"; done\n"
+        "fi\n"
+        "[ -z \"$out\" ] && exit 2\n"
+        "printf '\\000\\000\\000\\030ftypmp42\\000\\000\\000\\000mp42isom' > \"$out\"\n"
+        "printf 'rendered' >> \"$out\"\n"
+    )
+    script.chmod(0o755)
+    return script
+
+
+@pytest.fixture
+def remotion_root(tmp_path: Path) -> Path:
+    """Folder Remotion tiruan dengan public/ (tempat kra_temp di-stage)."""
+    root = tmp_path / "remotion_studio"
+    (root / "public" / "kra_temp").mkdir(parents=True)
+    return root

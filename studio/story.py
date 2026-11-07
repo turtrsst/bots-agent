@@ -1,0 +1,654 @@
+"""Jembatan JSON: naskah Clara → Whisper → Remotion CLI → concat.
+
+Ini pengganti `kra_remotion_concat_bridge.py`: satu skema tetap
+(`workspace/script_production.json`) yang dibaca oleh Remotion **dan** modul concat,
+tanpa parsing Markdown.
+
+Dua masalah klasik penyambungan Remotion dengan file lokal ditangani di sini:
+
+* **Blokir `file://`** — Chromium milik Remotion tidak boleh membuka path lokal, jadi
+  setiap aset disalin dulu ke `remotion_studio/public/kra_temp/`, lalu komponen
+  memanggil ``staticFile("kra_temp/...")``.
+* **Durasi statis** — panjang tiap scene dihitung dari transkrip Whisper (``max(end)``),
+  dikirim lewat props ``durationInSeconds``, dan ``calculateMetadata`` di ``Root.tsx``
+  mengubahnya menjadi ``durationInFrames``.
+
+Kalau Remotion/Node tidak tersedia (atau render satu scene gagal), scene itu dirakit
+dengan FFmpeg (conform + burn-in SRT) dan hasil akhirnya ditandai
+``engine="ffmpeg-fallback"`` — bukan diklaim sebagai render Remotion.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import shutil
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from .config import Settings
+from .media import (
+    Capabilities,
+    MediaError,
+    MediaPipeline,
+    StepResult,
+    detect_capabilities,
+    segments_to_srt,
+    subtitle_filter,
+)
+
+SCENE_TYPES = ("REMOTION_DYNAMIC", "CREATOR_AROLL")
+DEFAULT_COMPOSITION = "StoryScene"
+REMOTION_TIMEOUT = 2400
+CONCAT_TIMEOUT = 2400
+_SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+class StoryError(RuntimeError):
+    """Naskah tidak valid atau tidak ada scene yang bisa dirender."""
+
+
+# =====================================================================
+# Skema naskah
+# =====================================================================
+@dataclass
+class Scene:
+    scene_id: str
+    type: str
+    composition_id: str = DEFAULT_COMPOSITION
+    narration_text: str = ""
+    visual_cue: str = ""
+    broll_asset: str = ""
+    source_video: str = ""
+    lower_third_text: str = ""
+    highlight_words: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], index: int) -> Scene:
+        return cls(
+            scene_id=str(data.get("scene_id") or f"scene_{index + 1}"),
+            type=str(data.get("type") or "REMOTION_DYNAMIC").upper(),
+            composition_id=str(data.get("composition_id") or DEFAULT_COMPOSITION),
+            narration_text=str(data.get("narration_text") or ""),
+            visual_cue=str(data.get("visual_cue") or ""),
+            broll_asset=str(data.get("broll_asset") or ""),
+            source_video=str(data.get("source_video") or ""),
+            lower_third_text=str(data.get("lower_third_text") or ""),
+            highlight_words=[str(word) for word in (data.get("highlight_words") or [])],
+        )
+
+    @property
+    def media(self) -> str:
+        """Aset visual utama scene (A-Roll Creator didahulukan)."""
+        return self.source_video or self.broll_asset
+
+
+@dataclass
+class StoryScript:
+    project_id: str
+    title: str
+    fps: int
+    scenes: list[Scene]
+
+
+@dataclass
+class Validation:
+    ok: bool
+    problems: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    script: StoryScript | None = None
+
+
+def _is_safe_relative(name: str) -> bool:
+    if not name:
+        return False
+    path = Path(name)
+    return not path.is_absolute() and ".." not in path.parts
+
+
+def validate_story(data: Any) -> Validation:
+    """Periksa skema `script_production.json` sebelum dipakai Raka."""
+    problems: list[str] = []
+    warnings: list[str] = []
+
+    if not isinstance(data, dict):
+        return Validation(False, ["akar JSON harus sebuah objek"])
+
+    project_id = str(data.get("project_id") or "").strip()
+    title = str(data.get("title") or "").strip()
+    raw_scenes = data.get("scenes")
+
+    if not project_id:
+        problems.append("'project_id' wajib diisi (mis. story_kra_001)")
+    if not title:
+        problems.append("'title' wajib diisi")
+    try:
+        fps = int(data.get("fps", 30))
+        if not 1 <= fps <= 120:
+            problems.append(f"'fps' di luar rentang wajar: {fps}")
+    except (TypeError, ValueError):
+        fps = 30
+        problems.append("'fps' harus angka (mis. 30)")
+    if not isinstance(raw_scenes, list) or not raw_scenes:
+        problems.append("'scenes' harus array dan tidak boleh kosong")
+        raw_scenes = []
+
+    scenes: list[Scene] = []
+    seen_ids: set[str] = set()
+    for index, raw in enumerate(raw_scenes):
+        if not isinstance(raw, dict):
+            problems.append(f"scenes[{index}] bukan objek")
+            continue
+        scene = Scene.from_dict(raw, index)
+        if scene.scene_id in seen_ids:
+            problems.append(f"scene_id duplikat: {scene.scene_id}")
+        seen_ids.add(scene.scene_id)
+        if scene.type not in SCENE_TYPES:
+            problems.append(
+                f"{scene.scene_id}: type '{scene.type}' tidak dikenal (pilih {', '.join(SCENE_TYPES)})"
+            )
+        if not scene.narration_text.strip():
+            problems.append(f"{scene.scene_id}: 'narration_text' kosong")
+        if scene.source_video and not _is_safe_relative(scene.source_video):
+            problems.append(f"{scene.scene_id}: 'source_video' harus nama file relatif, bukan path luar")
+        if scene.broll_asset and not _is_safe_relative(scene.broll_asset):
+            problems.append(f"{scene.scene_id}: 'broll_asset' harus nama file relatif, bukan path luar")
+        if scene.type == "CREATOR_AROLL" and not scene.media:
+            problems.append(f"{scene.scene_id}: CREATOR_AROLL wajib punya 'source_video'")
+        if not scene.media:
+            warnings.append(f"{scene.scene_id}: tanpa aset video, scene dirender sebagai teks saja")
+        scenes.append(scene)
+
+    if not problems and not any(scene.media for scene in scenes):
+        warnings.append("tidak ada scene yang menyebut aset video; semua akan berbasis teks")
+
+    script = None if problems else StoryScript(project_id=project_id, title=title, fps=fps, scenes=scenes)
+    return Validation(ok=not problems, problems=problems, warnings=warnings, script=script)
+
+
+# =====================================================================
+# Whisper → words
+# =====================================================================
+def extract_whisper_words(whisper_json_path: Path) -> tuple[list[dict[str, Any]], float]:
+    """Ambil `[{word, start, end}]` + durasi dari JSON mentah Whisper."""
+    data = json.loads(Path(whisper_json_path).read_text(encoding="utf-8"))
+    words: list[dict[str, Any]] = []
+    duration = 0.0
+    for segment in data.get("segments", []) or []:
+        duration = max(duration, float(segment.get("end") or 0.0))
+        for item in segment.get("words", []) or []:
+            text = str(item.get("word") or "").strip()
+            if not text:
+                continue
+            words.append(
+                {
+                    "word": text,
+                    "start": round(float(item.get("start") or 0.0), 3),
+                    "end": round(float(item.get("end") or 0.0), 3),
+                }
+            )
+    if not duration:
+        duration = max((word["end"] for word in words), default=0.0)
+    return words, round(duration, 3)
+
+
+def safe_staged_name(scene_id: str, filename: str) -> str:
+    stem = _SAFE_NAME.sub("_", Path(filename).stem)[:60] or "asset"
+    suffix = _SAFE_NAME.sub("", Path(filename).suffix)[:8] or ".mp4"
+    return f"{_SAFE_NAME.sub('_', scene_id)[:40]}__{stem}{suffix}"
+
+
+def _concat_line(path: Path) -> str:
+    return "file '" + str(path.resolve()).replace("'", "'\\''") + "'"
+
+
+# =====================================================================
+# Hasil
+# =====================================================================
+@dataclass
+class SceneResult:
+    scene_id: str
+    type: str
+    composition_id: str
+    output: str = ""
+    engine: str = "skipped"  # remotion | ffmpeg | skipped
+    source: str = ""
+    duration_seconds: float = 0.0
+    words: int = 0
+    notes: list[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "scene_id": self.scene_id,
+            "type": self.type,
+            "composition_id": self.composition_id,
+            "output": self.output,
+            "engine": self.engine,
+            "source": self.source,
+            "duration_seconds": round(self.duration_seconds, 2),
+            "words": self.words,
+            "notes": self.notes,
+        }
+
+
+@dataclass
+class StoryResult:
+    ok: bool
+    output: Path
+    engine: str
+    project_id: str = ""
+    title: str = ""
+    fps: int = 30
+    scenes: list[SceneResult] = field(default_factory=list)
+    specs: dict[str, Any] = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
+    elapsed_seconds: float = 0.0
+    workdir: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "file": str(self.output),
+            "engine": self.engine,
+            "project_id": self.project_id,
+            "title": self.title,
+            "fps": self.fps,
+            "output_bytes": self.output.stat().st_size if self.output.exists() else 0,
+            "elapsed_seconds": round(self.elapsed_seconds, 2),
+            "workdir": self.workdir,
+            "scenes": [scene.as_dict() for scene in self.scenes],
+            "failed_scenes": [scene.scene_id for scene in self.scenes if not scene.output],
+            "notes": self.notes,
+            "specs": self.specs,
+        }
+
+
+# =====================================================================
+# Builder
+# =====================================================================
+class StoryBuilder:
+    """Rakit semua scene dari naskah JSON menjadi satu video final."""
+
+    def __init__(
+        self,
+        settings: Settings,
+        caps: Capabilities | None = None,
+        *,
+        pipeline: MediaPipeline | None = None,
+    ) -> None:
+        self.settings = settings
+        self.caps = caps or detect_capabilities(settings)
+        self.pipeline = pipeline or MediaPipeline(settings, self.caps)
+        self.workdir = self.pipeline.workdir / "story"
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        self._words_cache: dict[str, tuple[list[dict[str, Any]], float]] = {}
+
+    # -------------------------------------------------------------- lokasi
+    @property
+    def remotion_dir(self) -> Path | None:
+        if not self.settings.remotion_dir:
+            return None
+        path = Path(self.settings.remotion_dir).expanduser()
+        return path if path.is_dir() else None
+
+    @property
+    def public_temp(self) -> Path | None:
+        remotion = self.remotion_dir
+        return (remotion / "public" / "kra_temp") if remotion else None
+
+    def resolve_asset(self, name: str) -> Path | None:
+        """Cari aset di workspace/, input_creator/, output_ready/, lalu media/."""
+        if not name:
+            return None
+        candidate = Path(name)
+        if candidate.is_absolute():
+            return candidate if candidate.exists() else None
+        for folder in (
+            self.settings.paths.workspace,
+            self.settings.paths.input_creator,
+            self.settings.paths.output_ready,
+            self.settings.paths.media,
+        ):
+            path = folder / name
+            if path.exists():
+                return path
+        for path in self.settings.paths.workspace.rglob(Path(name).name):
+            if path.is_file():
+                return path
+        return None
+
+    # ------------------------------------------------------------ transkrip
+    def words_for(self, source: Path) -> tuple[list[dict[str, Any]], float]:
+        """Word-level timestamps untuk satu aset (di-cache per file+mtime)."""
+        stat = source.stat()
+        key = f"{source.resolve()}:{int(stat.st_mtime)}:{stat.st_size}"
+        if key in self._words_cache:
+            return self._words_cache[key]
+        if not self.caps.whisper:
+            self._words_cache[key] = ([], 0.0)
+            return self._words_cache[key]
+        transcript = self.workdir / f"whisper_{_SAFE_NAME.sub('_', source.stem)[:50]}.json"
+        try:
+            self.pipeline.transcribe(source, transcript)
+            words, duration = extract_whisper_words(transcript)
+        except Exception as exc:  # noqa: BLE001 - whisper gagal tidak boleh mematikan render
+            print(f"⚠️  Whisper gagal untuk {source.name}: {type(exc).__name__}: {exc}", flush=True)
+            self._words_cache[key] = ([], 0.0)
+            return self._words_cache[key]
+        self._words_cache[key] = (words, duration)
+        return words, duration
+
+    # ---------------------------------------------------------------- scene
+    def _stage(self, scene: Scene, source: Path) -> Path | None:
+        temp = self.public_temp
+        if temp is None:
+            return None
+        temp.mkdir(parents=True, exist_ok=True)
+        staged = temp / safe_staged_name(scene.scene_id, source.name)
+        shutil.copy2(source, staged)
+        return staged
+
+    @staticmethod
+    def _props(scene: Scene, staged_name: str, words: list[dict[str, Any]], duration: float) -> dict:
+        return {
+            "title": scene.narration_text,
+            "videoSrc": staged_name,
+            "words": words,
+            "highlightWords": scene.highlight_words,
+            "durationInSeconds": round(duration if duration > 0 else 5.0, 3),
+            "lowerThirdText": scene.lower_third_text,
+            "visualCue": scene.visual_cue,
+        }
+
+    def _render_with_remotion(
+        self, scene: Scene, props_path: Path, output: Path, notes: list[str]
+    ) -> str:
+        remotion = self.remotion_dir
+        if not (self.caps.npx and remotion):
+            notes.append("npx/remotion_dir tidak tersedia")
+            return "unavailable"
+        cmd = [
+            self.caps.npx,
+            "--yes",
+            "remotion",
+            "render",
+            scene.composition_id or DEFAULT_COMPOSITION,
+            str(output.resolve()),
+            f"--props={props_path.resolve()}",
+            "--codec=h264",
+            "--pixel-format=yuv420p",
+            "--log=error",
+        ]
+        try:
+            self.pipeline.run(cmd, cwd=remotion, timeout=REMOTION_TIMEOUT)
+        except MediaError as exc:
+            notes.append(f"remotion gagal: {str(exc)[:200]}")
+            return "failed"
+        if not output.exists() or output.stat().st_size == 0:
+            notes.append("remotion selesai tanpa menghasilkan file")
+            return "failed"
+        return "remotion"
+
+    def _render_with_ffmpeg(
+        self, source: Path | None, output: Path, words: list[dict[str, Any]], notes: list[str]
+    ) -> str:
+        """Fallback: conform klip ke 1080p + burn-in SRT (tanpa animasi Remotion)."""
+        if source is None:
+            notes.append("tidak ada aset video untuk fallback FFmpeg")
+            return "skipped"
+        steps: list[StepResult] = []
+        local_notes: list[str] = []
+        clip = self.pipeline.conform_clip(
+            source, self.workdir / f"conform_{output.stem}.mp4", steps, local_notes
+        )
+        notes.extend(local_notes)
+        for step in steps:
+            if step.status == "failed":
+                notes.append(f"conform gagal ({step.name}): {step.detail[:140]}")
+
+        if self.caps.whisper and words:
+            srt = self._write_srt(words, output)
+            if srt is not None and self._burn(clip, srt, output):
+                notes.append(f"subtitle burn-in dari Whisper ({len(words)} kata)")
+                return "ffmpeg"
+            notes.append("burn-in subtitle gagal; video fallback tanpa subtitle")
+        shutil.copyfile(clip, output)
+        return "ffmpeg"
+
+    def _write_srt(self, words: list[dict[str, Any]], output: Path) -> Path | None:
+        segments = [{"start": word["start"], "end": word["end"], "text": word["word"]} for word in words]
+        if not segments:
+            return None
+        srt = self.workdir / f"{output.stem}.srt"
+        srt.write_text(segments_to_srt(segments), encoding="utf-8")
+        return srt
+
+    def _burn(self, clip: Path, srt: Path, output: Path) -> bool:
+        try:
+            self.pipeline.run(
+                [
+                    self.caps.ffmpeg,
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    str(clip),
+                    "-vf",
+                    subtitle_filter(srt),
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    str(self.settings.render_crf),
+                    "-c:a",
+                    "copy",
+                    str(output),
+                ],
+                timeout=1800,
+            )
+        except MediaError:
+            return False
+        return output.exists() and output.stat().st_size > 0
+
+    # --------------------------------------------------------------- publik
+    def build(
+        self,
+        script_path: Path,
+        output_path: Path,
+        *,
+        transition: str = "directionalWarp",
+        transition_ms: int = 400,
+        fallback_source: str = "a_roll_raw.mp4",
+    ) -> StoryResult:
+        started = time.monotonic()
+        script_path = Path(script_path)
+        if not script_path.exists():
+            raise StoryError(f"naskah '{script_path.name}' tidak ditemukan di workspace")
+        try:
+            data = json.loads(script_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise StoryError(f"naskah '{script_path.name}' bukan JSON valid: {exc}") from exc
+
+        validation = validate_story(data)
+        if not validation.ok or validation.script is None:
+            raise StoryError("skema naskah tidak valid: " + "; ".join(validation.problems))
+        script = validation.script
+
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        result = StoryResult(
+            ok=False,
+            output=output_path,
+            engine="remotion" if self.remotion_dir else "ffmpeg-fallback",
+            project_id=script.project_id,
+            title=script.title,
+            fps=script.fps,
+            workdir=str(self.workdir),
+            notes=list(validation.warnings),
+        )
+        if not self.caps.ffmpeg:
+            raise StoryError("ffmpeg tidak ditemukan; tidak bisa menggabungkan scene")
+
+        fallback = self.resolve_asset(fallback_source)
+        can_remotion = bool(self.public_temp and self.caps.npx)
+        if not can_remotion:
+            result.notes.append(
+                "Remotion tidak siap (npx/STUDIO_REMOTION_DIR); semua scene dirakit dengan FFmpeg"
+            )
+
+        rendered: list[Path] = []
+        for index, scene in enumerate(script.scenes, start=1):
+            scene_result = SceneResult(
+                scene_id=scene.scene_id, type=scene.type, composition_id=scene.composition_id
+            )
+            source = self.resolve_asset(scene.media) if scene.media else None
+            if scene.media and source is None:
+                scene_result.notes.append(
+                    f"aset '{scene.media}' tidak ditemukan; memakai '{fallback_source}' bila ada"
+                )
+                source = fallback
+
+            words: list[dict[str, Any]] = []
+            duration = 0.0
+            if source is not None:
+                scene_result.source = str(source)
+                words, duration = self.words_for(source)
+                scene_result.words = len(words)
+                if not duration:
+                    probe = self.pipeline.probe(source)
+                    duration = float(probe.get("duration_s") or 0.0)
+                scene_result.duration_seconds = duration
+
+            scene_output = self.workdir / f"scene_{index:02d}_{_SAFE_NAME.sub('_', scene.scene_id)[:40]}.mp4"
+            engine = "skipped"
+            if can_remotion:
+                staged = self._stage(scene, source) if source is not None else None
+                props_path = (
+                    self.settings.paths.workspace
+                    / f"props_{index:02d}_{_SAFE_NAME.sub('_', scene.scene_id)[:40]}.json"
+                )
+                props_path.write_text(
+                    json.dumps(
+                        self._props(scene, staged.name if staged else "", words, duration),
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                scene_notes: list[str] = []
+                engine = self._render_with_remotion(scene, props_path, scene_output, scene_notes)
+                scene_result.notes.extend(scene_notes)
+
+            if engine != "remotion":
+                engine = self._render_with_ffmpeg(source, scene_output, words, scene_result.notes)
+
+            scene_result.engine = engine
+            if scene_output.exists() and scene_output.stat().st_size > 0:
+                scene_result.output = str(scene_output)
+                rendered.append(scene_output)
+            result.scenes.append(scene_result)
+
+        if not rendered:
+            raise StoryError(
+                "tidak ada scene yang berhasil dirender: "
+                + "; ".join(f"{scene.scene_id}({scene.engine})" for scene in result.scenes)
+            )
+
+        self._concat(
+            rendered,
+            output_path,
+            transition=transition,
+            transition_ms=transition_ms,
+            notes=result.notes,
+        )
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            raise StoryError("concat selesai tanpa menghasilkan file")
+
+        result.specs = self.pipeline.probe(output_path)
+        engines = {scene.engine for scene in result.scenes if scene.output}
+        if engines == {"remotion"}:
+            result.engine = "remotion"
+        elif engines == {"ffmpeg"}:
+            result.engine = "ffmpeg-fallback"
+        else:
+            result.engine = "mixed"
+        result.ok = True
+        result.elapsed_seconds = time.monotonic() - started
+        self._cleanup_public_temp()
+        return result
+
+    # ---------------------------------------------------------------- concat
+    def _concat(
+        self,
+        scenes: list[Path],
+        output: Path,
+        *,
+        transition: str,
+        transition_ms: int,
+        notes: list[str],
+    ) -> None:
+        if len(scenes) == 1:
+            shutil.copyfile(scenes[0], output)
+            notes.append("hanya satu scene; concat dilewati")
+            return
+
+        remotion = self.remotion_dir
+        if self.caps.npx and remotion and transition:
+            base: list[str] = []
+            if shutil.which("xvfb-run"):
+                base = ["xvfb-run", "-a", "-s", "-ac -screen 0 1920x1080x24"]
+            cmd = base + [
+                self.caps.npx,
+                "--yes",
+                "ffmpeg-concat",
+                "-t",
+                transition,
+                "-d",
+                str(transition_ms),
+                "-o",
+                str(output.resolve()),
+                *[str(path.resolve()) for path in scenes],
+            ]
+            try:
+                self.pipeline.run(cmd, cwd=remotion, timeout=CONCAT_TIMEOUT)
+                if output.exists() and output.stat().st_size > 0:
+                    notes.append(f"concat transisi '{transition}' via ffmpeg-concat")
+                    return
+                notes.append("ffmpeg-concat selesai tanpa output; fallback ffmpeg concat")
+            except MediaError as exc:
+                notes.append(f"ffmpeg-concat gagal ({str(exc)[:160]}); fallback ffmpeg concat")
+
+        list_path = self.workdir / "concat.txt"
+        list_path.write_text("\n".join(_concat_line(path) for path in scenes), encoding="utf-8")
+        self.pipeline.run(
+            [
+                self.caps.ffmpeg,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(list_path),
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(output),
+            ]
+        )
+        notes.append("concat via ffmpeg demuxer (tanpa transisi)")
+
+    def _cleanup_public_temp(self) -> None:
+        temp = self.public_temp
+        if temp is None:
+            return
+        for path in temp.glob("*"):
+            if path.is_file():
+                path.unlink(missing_ok=True)
