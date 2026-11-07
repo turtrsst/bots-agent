@@ -1,6 +1,8 @@
 import React from 'react';
 import {
   AbsoluteFill,
+  Audio,
+  Img,
   interpolate,
   staticFile,
   useCurrentFrame,
@@ -17,12 +19,15 @@ export interface WhisperWord {
 export interface StorySceneProps {
   /** narration_text dari script_production.json */
   title: string;
-  /** Nama file di public/kra_temp/ (string kosong = scene teks saja) */
-  videoSrc: string;
+  /** Video A-Roll Creator atau B-Roll, ada di public/kra_temp/ */
+  videoSrc?: string;
+  /** Suara narasi TTS (mode faceless), ada di public/kra_temp/ */
+  audioSrc?: string;
+  /** Gambar latar (Ken Burns) bila tidak ada video */
+  bgImageSrc?: string;
   words: WhisperWord[];
   highlightWords: string[];
   durationInSeconds: number;
-  /** Opsional, dipakai composition CreatorOverlay */
   lowerThirdText?: string;
   showLowerThird?: boolean;
   visualCue?: string;
@@ -31,6 +36,8 @@ export interface StorySceneProps {
 export const defaultStoryProps: StorySceneProps = {
   title: 'Judul scene',
   videoSrc: '',
+  audioSrc: '',
+  bgImageSrc: '',
   words: [],
   highlightWords: [],
   durationInSeconds: 5,
@@ -53,27 +60,32 @@ const isHighlighted = (word: string, highlights: string[]): boolean => {
 };
 
 /**
- * Chapter 03: scene narasi dengan caption per kata dari Whisper.
+ * Satu scene cerita: video/gambar latar + narasi (audio asli atau TTS) + caption
+ * per kata dari Whisper.
  *
- * Catatan penting soal `staticFile()`: Chromium headless milik Remotion tidak
- * boleh membuka `file://`, jadi video harus berada di `public/kra_temp/`.
- * `studio/story.py` menyalin aset ke sana sebelum render dan membersihkannya
- * setelah semua scene selesai.
+ * `staticFile('kra_temp/...')` wajib karena Chromium headless Remotion menolak
+ * `file://`. `studio/story.py` menyalin semua aset ke `public/kra_temp/` sebelum
+ * render dan membersihkannya setelah selesai.
  */
 export const StoryScene: React.FC<StorySceneProps> = ({
-  title,
   videoSrc,
+  audioSrc,
+  bgImageSrc,
   words,
   highlightWords,
   lowerThirdText,
   showLowerThird,
 }) => {
   const frame = useCurrentFrame();
-  const { fps } = useVideoConfig();
+  const { fps, durationInFrames } = useVideoConfig();
   const currentTime = frame / fps;
 
-  // Kata yang sedang diucapkan; kalau ada jeda pendek, tahan kata terakhir
-  // supaya caption tidak berkedip hilang di antara dua kata.
+  // Ken Burns halus untuk latar statis / B-Roll saat narasi TTS berjalan.
+  const scale = interpolate(frame, [0, Math.max(1, durationInFrames)], [1, 1.1], {
+    extrapolateRight: 'clamp',
+  });
+
+  // Kata yang sedang diucapkan; tahan 0.25 s supaya caption tidak berkedip.
   let activeWord = '';
   let highlighted = false;
   for (let index = 0; index < words.length; index += 1) {
@@ -89,24 +101,42 @@ export const StoryScene: React.FC<StorySceneProps> = ({
     }
   }
 
-  const pop = interpolate(frame % Math.max(1, Math.round(fps * 0.4)), [0, 6], [0.94, 1], {
-    extrapolateRight: 'clamp',
-  });
-
   return (
-    <AbsoluteFill style={{ backgroundColor: '#0f0f14' }}>
+    <AbsoluteFill style={{ backgroundColor: '#0b0c10', overflow: 'hidden' }}>
       {videoSrc ? (
         <Video
           src={staticFile(`kra_temp/${videoSrc}`)}
-          style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-        />
-      ) : (
-        <AbsoluteFill
           style={{
-            background: 'radial-gradient(circle at 30% 30%, #1b1440 0%, #0f0f14 70%)',
+            width: '100%',
+            height: '100%',
+            objectFit: 'cover',
+            transform: audioSrc ? `scale(${scale})` : 'none',
+          }}
+          muted={Boolean(audioSrc)}
+        />
+      ) : null}
+
+      {!videoSrc && bgImageSrc ? (
+        <Img
+          src={staticFile(`kra_temp/${bgImageSrc}`)}
+          style={{
+            width: '100%',
+            height: '100%',
+            objectFit: 'cover',
+            transform: `scale(${scale})`,
           }}
         />
-      )}
+      ) : null}
+
+      {!videoSrc && !bgImageSrc ? (
+        <AbsoluteFill
+          style={{
+            background: 'radial-gradient(circle at 30% 30%, #1b1440 0%, #0b0c10 70%)',
+          }}
+        />
+      ) : null}
+
+      {audioSrc ? <Audio src={staticFile(`kra_temp/${audioSrc}`)} /> : null}
 
       {showLowerThird && lowerThirdText ? (
         <AbsoluteFill style={{ justifyContent: 'flex-start', alignItems: 'flex-start', padding: 64 }}>
@@ -115,11 +145,10 @@ export const StoryScene: React.FC<StorySceneProps> = ({
               fontFamily: 'Montserrat, sans-serif',
               fontSize: 34,
               fontWeight: 700,
-              color: '#0f0f14',
+              color: '#0b0c10',
               backgroundColor: '#FFE600',
               padding: '10px 24px',
               borderRadius: 8,
-              letterSpacing: 0.5,
             }}
           >
             {lowerThirdText}
@@ -129,29 +158,25 @@ export const StoryScene: React.FC<StorySceneProps> = ({
 
       {activeWord ? (
         <AbsoluteFill
-          style={{ justifyContent: 'flex-end', alignItems: 'center', paddingBottom: 120 }}
+          style={{ justifyContent: 'flex-end', alignItems: 'center', paddingBottom: 140 }}
         >
           <div
             style={{
               fontFamily: 'Montserrat, sans-serif',
-              fontSize: highlighted ? 78 : 64,
+              fontSize: highlighted ? 80 : 64,
               fontWeight: 900,
-              color: highlighted ? '#FFE600' : '#FFFFFF',
+              color: highlighted ? '#00F5D4' : '#FFFFFF',
               textTransform: 'uppercase',
-              textShadow: '0px 6px 24px rgba(0,0,0,0.9)',
-              backgroundColor: 'rgba(0,0,0,0.55)',
-              padding: '12px 32px',
-              borderRadius: 16,
-              transform: `scale(${pop})`,
+              textShadow: '0px 8px 28px rgba(0,0,0,0.95)',
+              backgroundColor: 'rgba(10, 12, 18, 0.72)',
+              padding: '14px 36px',
+              borderRadius: 18,
+              border: highlighted ? '3px solid #00F5D4' : 'none',
             }}
           >
             {activeWord}
           </div>
         </AbsoluteFill>
-      ) : null}
-
-      {title ? (
-        <AbsoluteFill style={{ opacity: 0 }} aria-label={title} />
       ) : null}
     </AbsoluteFill>
   );

@@ -70,6 +70,16 @@ class StudioPaths:
     def memory_db(self) -> Path:
         return self.workspace / "studio.db"
 
+    @property
+    def pipeline_state(self) -> Path:
+        """Status pipeline yang dibaca scheduler n100n (`/kra/schedule/2-check-gate`)."""
+        return self.workspace / "pipeline_state.json"
+
+    @property
+    def processed(self) -> Path:
+        """Arsip rekaman yang sudah diproduksi (agar tidak diproses dua kali)."""
+        return self.input_creator / "processed"
+
     def ensure(self) -> StudioPaths:
         for folder in (self.agents, self.workspace, self.input_creator, self.output_ready):
             folder.mkdir(parents=True, exist_ok=True)
@@ -112,6 +122,14 @@ class Settings:
     youtube_api_key: str = ""
     tavily_api_key: str = ""
     serpapi_api_key: str = ""
+    # --- TTS (mode faceless)
+    tts_provider: str = "auto"
+    elevenlabs_api_key: str = ""
+    elevenlabs_voice_id: str = "pNInz6obpgDQGcFmaJgB"
+    edge_tts_voice: str = "id-ID-ArdiNeural"
+    tts_rate: str = "+5%"
+    # --- pipeline state untuk n100n
+    require_creator_aroll: bool = True
 
     # ------------------------------------------------------------------ setup
     @classmethod
@@ -168,6 +186,12 @@ class Settings:
             youtube_api_key=pick("STUDIO_YOUTUBE_API_KEY", "YOUTUBE_API_KEY"),
             tavily_api_key=pick("STUDIO_TAVILY_API_KEY", "TAVILY_API_KEY"),
             serpapi_api_key=pick("STUDIO_SERPAPI_API_KEY", "SERPAPI_API_KEY"),
+            tts_provider=(pick("STUDIO_TTS_PROVIDER") or "auto").lower(),
+            elevenlabs_api_key=pick("STUDIO_ELEVENLABS_API_KEY", "ELEVENLABS_API_KEY"),
+            elevenlabs_voice_id=pick("STUDIO_ELEVENLABS_VOICE_ID") or "pNInz6obpgDQGcFmaJgB",
+            edge_tts_voice=pick("STUDIO_EDGE_TTS_VOICE") or "id-ID-ArdiNeural",
+            tts_rate=pick("STUDIO_TTS_RATE") or "+5%",
+            require_creator_aroll=env_flag("STUDIO_REQUIRE_AROLL", True, source),
         )
 
     def with_changes(self, **kwargs) -> Settings:
@@ -220,8 +244,9 @@ class Settings:
             )
             if key
         ]
+        tts = "elevenlabs" if self.elevenlabs_api_key else "edge"
         return (
             f"model={self.model} | endpoint={base} | temperature={self.temperature} | "
             f"max_rounds={self.max_rounds} | api_key={self.masked_api_key()} | gate={mode} | "
-            f"riset={','.join(research) or 'off'} | root={self.paths.root}"
+            f"riset={','.join(research) or 'off'} | tts={tts} | root={self.paths.root}"
         )

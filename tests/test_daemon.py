@@ -266,3 +266,88 @@ def test_watcher_queues_production_when_file_lands(settings: Settings, notifier)
 def test_job_as_dict_is_json_serialisable() -> None:
     job = Job(id="job-1", phase="ideation", topic="x")
     assert json.loads(json.dumps(job.as_dict()))["id"] == "job-1"
+
+
+# --------------------------------------------------- dual-loop pipeline state
+def test_ideation_sets_waiting_for_creator(settings: Settings, notifier) -> None:
+    daemon = make_daemon(settings, notifier, lambda *a, **k: FakeOffice(summary(), []))
+    daemon.submit_ideation("Ide pagi")
+    asyncio.run(daemon.drain())
+
+    state = daemon.state.read()
+    assert state["status"] == "WAITING_FOR_CREATOR"
+    assert state["details"]["expected_file"] == "a_roll_raw.mp4"
+    assert state["details"]["script_file"] == "script_production.json"
+
+
+def test_faceless_ideation_never_waits_for_creator(settings: Settings, notifier) -> None:
+    seen: dict = {}
+
+    def factory(*_args, **kwargs):
+        seen.update(kwargs)
+        return FakeOffice(summary(), [])
+
+    daemon = make_daemon(settings, notifier, factory)
+    daemon.submit_ideation("Ide faceless", require_aroll=False)
+    asyncio.run(daemon.drain())
+
+    assert seen["require_creator_aroll"] is False
+    state = daemon.state.read()
+    assert state["status"] == "READY_FOR_RENDER"
+    assert state["details"]["faceless"] is True
+
+
+def test_production_publishes_then_archives_raw(settings: Settings, notifier) -> None:
+    completed = summary(completed=True, awaiting_creator=False, youtube_url="https://youtu.be/abc")
+
+    def on_run(topic: str, raw_file: str) -> None:
+        (settings.paths.workspace / "content_brief.json").write_text(
+            json.dumps({"titles": [{"title": "Judul"}]}), encoding="utf-8"
+        )
+
+    daemon = make_daemon(settings, notifier, lambda *a, **k: FakeOffice(completed, [], on_run))
+    raw = _video(settings.paths.input_creator / "a_roll_raw.mp4")
+
+    job = daemon.submit_production(str(raw))
+    assert daemon.state.status() == "RENDERING"
+    asyncio.run(daemon.drain())
+
+    state = daemon.state.read()
+    assert job.status == "done"
+    assert state["status"] == "PUBLISHED_COMPLETE"
+    assert state["details"]["youtube_url"] == "https://youtu.be/abc"
+    assert not raw.exists()
+    assert (settings.paths.processed / "a_roll_raw.mp4").exists()
+
+
+def test_failed_job_marks_state_error(settings: Settings, notifier) -> None:
+    class Boom:
+        def run(self, topic: str, *, raw_file: str = "") -> RunSummary:
+            raise RuntimeError("kuota habis")
+
+    daemon = make_daemon(settings, notifier, lambda *a, **k: Boom())
+    daemon.submit_ideation("Ide")
+    asyncio.run(daemon.drain())
+
+    state = daemon.state.read()
+    assert state["status"] == "ERROR"
+    assert "kuota habis" in state["details"]["error"]
+
+
+def test_submit_production_is_idempotent(settings: Settings, notifier) -> None:
+    daemon = make_daemon(settings, notifier, lambda *a, **k: None)
+    raw = _video(settings.paths.input_creator / "a_roll_raw.mp4")
+
+    first = daemon.submit_production(str(raw))
+    second = daemon.submit_production(str(raw))
+
+    assert first.id == second.id
+    assert daemon.queue.qsize() == 1
+
+
+def test_status_includes_pipeline_state(settings: Settings, notifier) -> None:
+    daemon = make_daemon(settings, notifier, lambda *a, **k: None)
+    daemon.state.update("READY_FOR_RENDER", script_file="script_production.json")
+
+    assert daemon.status()["pipeline_state"]["status"] == "READY_FOR_RENDER"
+    assert "Pipeline: READY_FOR_RENDER" in daemon.status_text()

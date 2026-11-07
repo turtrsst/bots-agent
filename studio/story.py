@@ -33,17 +33,21 @@ from .media import (
     Capabilities,
     MediaError,
     MediaPipeline,
-    StepResult,
     detect_capabilities,
     segments_to_srt,
     subtitle_filter,
 )
+from .tts import Narration, TTSError, synthesize
 
 SCENE_TYPES = ("REMOTION_DYNAMIC", "CREATOR_AROLL")
+TTS_TAIL_SECONDS = 0.35  # ekor kecil supaya caption terakhir tidak terpotong
 DEFAULT_COMPOSITION = "StoryScene"
 REMOTION_TIMEOUT = 2400
 CONCAT_TIMEOUT = 2400
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+TTSFn = Any  # Callable[[Settings, str, Path, ...], Narration]
 
 
 class StoryError(RuntimeError):
@@ -64,6 +68,8 @@ class Scene:
     source_video: str = ""
     lower_third_text: str = ""
     highlight_words: list[str] = field(default_factory=list)
+    bg_image: str = ""
+    voice_id: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], index: int) -> Scene:
@@ -77,6 +83,8 @@ class Scene:
             source_video=str(data.get("source_video") or ""),
             lower_third_text=str(data.get("lower_third_text") or ""),
             highlight_words=[str(word) for word in (data.get("highlight_words") or [])],
+            bg_image=str(data.get("bg_image") or ""),
+            voice_id=str(data.get("voice_id") or ""),
         )
 
     @property
@@ -155,10 +163,14 @@ def validate_story(data: Any) -> Validation:
             problems.append(f"{scene.scene_id}: 'source_video' harus nama file relatif, bukan path luar")
         if scene.broll_asset and not _is_safe_relative(scene.broll_asset):
             problems.append(f"{scene.scene_id}: 'broll_asset' harus nama file relatif, bukan path luar")
+        if scene.bg_image and not _is_safe_relative(scene.bg_image):
+            problems.append(f"{scene.scene_id}: 'bg_image' harus nama file relatif, bukan path luar")
         if scene.type == "CREATOR_AROLL" and not scene.media:
             problems.append(f"{scene.scene_id}: CREATOR_AROLL wajib punya 'source_video'")
-        if not scene.media:
-            warnings.append(f"{scene.scene_id}: tanpa aset video, scene dirender sebagai teks saja")
+        if not scene.media and not scene.bg_image:
+            warnings.append(
+                f"{scene.scene_id}: tanpa aset visual, scene memakai latar gelap + narasi TTS/teks"
+            )
         scenes.append(scene)
 
     if not problems and not any(scene.media for scene in scenes):
@@ -215,6 +227,8 @@ class SceneResult:
     output: str = ""
     engine: str = "skipped"  # remotion | ffmpeg | skipped
     source: str = ""
+    audio: str = ""
+    audio_provider: str = ""
     duration_seconds: float = 0.0
     words: int = 0
     notes: list[str] = field(default_factory=list)
@@ -227,6 +241,8 @@ class SceneResult:
             "output": self.output,
             "engine": self.engine,
             "source": self.source,
+            "audio": self.audio,
+            "audio_provider": self.audio_provider,
             "duration_seconds": round(self.duration_seconds, 2),
             "words": self.words,
             "notes": self.notes,
@@ -246,11 +262,13 @@ class StoryResult:
     notes: list[str] = field(default_factory=list)
     elapsed_seconds: float = 0.0
     workdir: str = ""
+    tts_providers: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "file": str(self.output),
             "engine": self.engine,
+            "tts_providers": self.tts_providers,
             "project_id": self.project_id,
             "title": self.title,
             "fps": self.fps,
@@ -276,12 +294,14 @@ class StoryBuilder:
         caps: Capabilities | None = None,
         *,
         pipeline: MediaPipeline | None = None,
+        tts: TTSFn | None = None,
     ) -> None:
         self.settings = settings
         self.caps = caps or detect_capabilities(settings)
         self.pipeline = pipeline or MediaPipeline(settings, self.caps)
         self.workdir = self.pipeline.workdir / "story"
         self.workdir.mkdir(parents=True, exist_ok=True)
+        self.tts = tts or synthesize
         self._words_cache: dict[str, tuple[list[dict[str, Any]], float]] = {}
 
     # -------------------------------------------------------------- lokasi
@@ -340,23 +360,50 @@ class StoryBuilder:
         return words, duration
 
     # ---------------------------------------------------------------- scene
-    def _stage(self, scene: Scene, source: Path) -> Path | None:
+    def _stage(self, scene: Scene, asset: Path) -> Path | None:
+        """Salin aset ke public/kra_temp/ supaya staticFile() aman di Chromium."""
         temp = self.public_temp
         if temp is None:
             return None
         temp.mkdir(parents=True, exist_ok=True)
-        staged = temp / safe_staged_name(scene.scene_id, source.name)
-        shutil.copy2(source, staged)
+        staged = temp / safe_staged_name(scene.scene_id, asset.name)
+        shutil.copy2(asset, staged)
         return staged
 
+    def _narrate(self, scene: Scene) -> Narration | None:
+        """Voiceover TTS untuk mode faceless (tanpa rekaman Creator)."""
+        if not scene.narration_text.strip():
+            return None
+        try:
+            return self.tts(
+                self.settings,
+                scene.narration_text,
+                self.workdir,
+                scene_id=scene.scene_id,
+                ffmpeg=self.caps.ffmpeg,
+                voice_id=scene.voice_id or None,
+            )
+        except TTSError as exc:
+            return Narration(provider="", path=Path(), notes=[f"TTS gagal: {str(exc)[:200]}"])
+
     @staticmethod
-    def _props(scene: Scene, staged_name: str, words: list[dict[str, Any]], duration: float) -> dict:
+    def _props(
+        scene: Scene,
+        *,
+        video_name: str,
+        audio_name: str,
+        image_name: str,
+        words: list[dict[str, Any]],
+        duration: float,
+    ) -> dict:
         return {
             "title": scene.narration_text,
-            "videoSrc": staged_name,
+            "videoSrc": video_name,
+            "audioSrc": audio_name,
+            "bgImageSrc": image_name,
             "words": words,
             "highlightWords": scene.highlight_words,
-            "durationInSeconds": round(duration if duration > 0 else 5.0, 3),
+            "durationInSeconds": round((duration + TTS_TAIL_SECONDS) if duration > 0 else 5.0, 3),
             "lowerThirdText": scene.lower_third_text,
             "visualCue": scene.visual_cue,
         }
@@ -391,29 +438,78 @@ class StoryBuilder:
         return "remotion"
 
     def _render_with_ffmpeg(
-        self, source: Path | None, output: Path, words: list[dict[str, Any]], notes: list[str]
+        self,
+        source: Path | None,
+        audio: Path | None,
+        words: list[dict[str, Any]],
+        output: Path,
+        notes: list[str],
     ) -> str:
-        """Fallback: conform klip ke 1080p + burn-in SRT (tanpa animasi Remotion)."""
-        if source is None:
-            notes.append("tidak ada aset video untuk fallback FFmpeg")
+        """Fallback: 1080p + audio (video/TTS) + burn-in SRT, tanpa animasi Remotion."""
+        if source is None and audio is None:
+            notes.append("tidak ada video maupun audio untuk fallback FFmpeg")
             return "skipped"
-        steps: list[StepResult] = []
-        local_notes: list[str] = []
-        clip = self.pipeline.conform_clip(
-            source, self.workdir / f"conform_{output.stem}.mp4", steps, local_notes
-        )
-        notes.extend(local_notes)
-        for step in steps:
-            if step.status == "failed":
-                notes.append(f"conform gagal ({step.name}): {step.detail[:140]}")
 
+        cmd = [self.caps.ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
+        if source is None:
+            cmd += [
+                "-f",
+                "lavfi",
+                "-i",
+                f"color=c=0x0f0f14:s={self.pipeline.width}x{self.pipeline.height}:"
+                f"r={self.pipeline.fps}",
+            ]
+        else:
+            cmd += ["-i", str(source)]
+        if audio is not None:
+            cmd += ["-i", str(audio)]
+
+        vf = (
+            f"scale={self.pipeline.width}:{self.pipeline.height}:force_original_aspect_ratio=decrease,"
+            f"pad={self.pipeline.width}:{self.pipeline.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={self.pipeline.fps}"
+        )
         if self.caps.whisper and words:
             srt = self._write_srt(words, output)
-            if srt is not None and self._burn(clip, srt, output):
+            if srt is not None:
+                vf += "," + subtitle_filter(srt)
                 notes.append(f"subtitle burn-in dari Whisper ({len(words)} kata)")
-                return "ffmpeg"
-            notes.append("burn-in subtitle gagal; video fallback tanpa subtitle")
-        shutil.copyfile(clip, output)
+
+        cmd += ["-map", "0:v:0"]
+        if audio is not None:
+            cmd += ["-map", "1:a:0"]
+        elif source is not None:
+            cmd += ["-map", "0:a:0?"]
+        cmd += [
+            "-vf",
+            vf,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            str(self.settings.render_crf),
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-b:a",
+            "192k",
+            "-shortest",
+            str(output),
+        ]
+        try:
+            self.pipeline.run(cmd, timeout=1800)
+        except MediaError as exc:
+            notes.append(f"ffmpeg fallback gagal: {str(exc)[:200]}")
+            return "failed"
+        if not output.exists() or output.stat().st_size == 0:
+            return "failed"
+        if not self.caps.whisper or not words:
+            notes.append("tanpa subtitle (Whisper/kata tidak tersedia)")
         return "ffmpeg"
 
     def _write_srt(self, words: list[dict[str, Any]], output: Path) -> Path | None:
@@ -423,35 +519,6 @@ class StoryBuilder:
         srt = self.workdir / f"{output.stem}.srt"
         srt.write_text(segments_to_srt(segments), encoding="utf-8")
         return srt
-
-    def _burn(self, clip: Path, srt: Path, output: Path) -> bool:
-        try:
-            self.pipeline.run(
-                [
-                    self.caps.ffmpeg,
-                    "-y",
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-i",
-                    str(clip),
-                    "-vf",
-                    subtitle_filter(srt),
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "veryfast",
-                    "-crf",
-                    str(self.settings.render_crf),
-                    "-c:a",
-                    "copy",
-                    str(output),
-                ],
-                timeout=1800,
-            )
-        except MediaError:
-            return False
-        return output.exists() and output.stat().st_size > 0
 
     # --------------------------------------------------------------- publik
     def build(
@@ -504,35 +571,82 @@ class StoryBuilder:
             scene_result = SceneResult(
                 scene_id=scene.scene_id, type=scene.type, composition_id=scene.composition_id
             )
+
+            # 1) Tentukan aset visual: A-Roll Creator > B-Roll > gambar latar.
             source = self.resolve_asset(scene.media) if scene.media else None
             if scene.media and source is None:
                 scene_result.notes.append(
                     f"aset '{scene.media}' tidak ditemukan; memakai '{fallback_source}' bila ada"
                 )
                 source = fallback
+            image = self.resolve_asset(scene.bg_image) if scene.bg_image else None
+            if scene.bg_image and image is None:
+                scene_result.notes.append(f"gambar latar '{scene.bg_image}' tidak ditemukan")
 
-            words: list[dict[str, Any]] = []
-            duration = 0.0
+            uses_creator_video = scene.type == "CREATOR_AROLL" and source is not None
+            narration: Narration | None = None
+            audio: Path | None = None
+
+            # 2) Sumber audio: A-Roll Creator (audio asli) atau TTS (mode faceless).
             if source is not None:
                 scene_result.source = str(source)
-                words, duration = self.words_for(source)
-                scene_result.words = len(words)
-                if not duration:
-                    probe = self.pipeline.probe(source)
-                    duration = float(probe.get("duration_s") or 0.0)
-                scene_result.duration_seconds = duration
+            if not uses_creator_video and scene.narration_text.strip():
+                narration = self._narrate(scene)
+                if narration is not None:
+                    scene_result.notes.extend(narration.notes)
+                    if narration.path.is_file() and narration.path.stat().st_size > 0:
+                        audio = narration.path
+                        scene_result.audio = str(audio)
+                        scene_result.audio_provider = narration.provider
+                        if narration.provider:
+                            result.tts_providers.append(narration.provider)
+                    else:
+                        scene_result.notes.append("narasi TTS tidak terbentuk; scene tanpa suara")
 
+            # 3) Word-level timestamps: dari video Creator atau dari audio TTS.
+            words: list[dict[str, Any]] = []
+            duration = 0.0
+            timing_source = audio or (source if uses_creator_video else None)
+            if timing_source is not None:
+                words, duration = self.words_for(timing_source)
+                scene_result.words = len(words)
+            if not duration and source is not None:
+                probe = self.pipeline.probe(source)
+                duration = float(probe.get("duration_s") or 0.0)
+            if not duration and audio is not None:
+                probe = self.pipeline.probe(audio)
+                duration = float(probe.get("duration_s") or 0.0)
+            scene_result.duration_seconds = duration
+
+            # 4) Render scene.
             scene_output = self.workdir / f"scene_{index:02d}_{_SAFE_NAME.sub('_', scene.scene_id)[:40]}.mp4"
             engine = "skipped"
             if can_remotion:
-                staged = self._stage(scene, source) if source is not None else None
+                video_name = image_name = audio_name = ""
+                if source is not None:
+                    staged = self._stage(scene, source)
+                    video_name = staged.name if staged else ""
+                if image is not None:
+                    staged_image = self._stage(scene, image)
+                    image_name = staged_image.name if staged_image else ""
+                if audio is not None:
+                    staged_audio = self._stage(scene, audio)
+                    audio_name = staged_audio.name if staged_audio else ""
+
                 props_path = (
                     self.settings.paths.workspace
                     / f"props_{index:02d}_{_SAFE_NAME.sub('_', scene.scene_id)[:40]}.json"
                 )
                 props_path.write_text(
                     json.dumps(
-                        self._props(scene, staged.name if staged else "", words, duration),
+                        self._props(
+                            scene,
+                            video_name=video_name,
+                            audio_name=audio_name,
+                            image_name=image_name,
+                            words=words,
+                            duration=duration,
+                        ),
                         ensure_ascii=False,
                         indent=2,
                     ),
@@ -543,7 +657,13 @@ class StoryBuilder:
                 scene_result.notes.extend(scene_notes)
 
             if engine != "remotion":
-                engine = self._render_with_ffmpeg(source, scene_output, words, scene_result.notes)
+                engine = self._render_with_ffmpeg(
+                    source,
+                    audio,
+                    words,
+                    scene_output,
+                    scene_result.notes,
+                )
 
             scene_result.engine = engine
             if scene_output.exists() and scene_output.stat().st_size > 0:

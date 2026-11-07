@@ -32,6 +32,8 @@ STUDIO_REMOTION_COMPOSITION=StoryScene
 | Durasi komposisi statis | `calculateMetadata` menghitung `durationInFrames` dari `durationInSeconds` (hasil Whisper) |
 | Caption per kata berkedip | kata terakhir "ditahan" 0.25 s sampai kata berikutnya |
 | `composition_id` berbeda per scene (`StoryScene`, `CreatorOverlay`) | keduanya didaftarkan dan memakai props yang sama |
+| Mode faceless butuh suara | `audioSrc` (TTS ElevenLabs/Edge) + `Audio`, video latar otomatis `muted` |
+| Scene tanpa video | `bgImageSrc` + efek Ken Burns, atau latar gradien bila tidak ada gambar |
 | Highlight dari Clara (`highlight_words`) | dicocokkan tanpa huruf besar/tanda baca |
 
 ## Props yang dikirim `studio/story.py`
@@ -40,6 +42,8 @@ STUDIO_REMOTION_COMPOSITION=StoryScene
 {
   "title": "Pernahkah kamu membayangkan kantor yang berjalan sendiri?",
   "videoSrc": "scene_1_hook__broll_server.mp4",
+  "audioSrc": "scene_1_hook__tts_norm_scene_1_hook.mp3",
+  "bgImageSrc": "",
   "words": [{"word": "kantor", "start": 0.42, "end": 0.88}],
   "highlightWords": ["berjalan sendiri", "tidur"],
   "durationInSeconds": 7.31,

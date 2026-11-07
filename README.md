@@ -13,6 +13,11 @@ sesuai jadwal, memantau folder `input_creator/`, merender dengan ffmpeg/Whisper/
 auto-editor/Remotion, mengingat performa video sebelumnya, dan mengabari Anda lewat
 Telegram. Lihat [Daemon 24/7](#6-daemon-247) dan [Integrasi KRA & n100n](#7-integrasi-kra--n100n).
 
+Sejak v2.1 kantor ini juga bisa **faceless**: tanpa rekaman Creator sama sekali. Clara
+menulis narasi, mesin TTS (ElevenLabs → Edge-TTS) mengisi suara, Whisper menyelaraskan
+caption, Remotion merakit. Scheduler dual-loop `n100n` (08:00 + polling 30 menit)
+cukup memanggil tiga endpoint. Lihat [Mode faceless & scheduler dual-loop](#7b-mode-faceless--scheduler-dual-loop).
+
 ```
 Creator_Kamu (topik)
       │
@@ -48,6 +53,9 @@ python virtual_office_superbots.py --rehearsal -t "Cara membangun tim AI Agent"
 # 2) Jalankan rapat otonom sungguhan
 python virtual_office_superbots.py -t "Workflow editing video 2026"
 
+# 3) Mode faceless: tanpa rekaman Creator, narasi diisi TTS
+python virtual_office_superbots.py -t "Kenapa startup AI butuh content engine" --faceless
+
 # Tanpa argumen, topik ditanya interaktif seperti skrip asli
 python virtual_office_superbots.py
 ```
@@ -62,7 +70,7 @@ python virtual_office_superbots.py --status          # antrean daemon + isi memo
 
 # mode 24/7 (tanpa terminal, tanpa input())
 python virtual_office_superbots.py --daemon          # scheduler + file watcher + notifikasi
-python virtual_office_superbots.py --serve           # bridge HTTP untuk webhook n100n (port 8100)
+python virtual_office_superbots.py --serve           # bridge HTTP + jadwal dual-loop n100n (port 8100)
 ```
 
 Keluaran ada di `workspace/`, `input_creator/`, `output_ready/`:
@@ -79,6 +87,7 @@ Keluaran ada di `workspace/`, `input_creator/`, `output_ready/`:
 | `output_ready/final_render.mp4` | hasil render Raka |
 | `output_ready/final_render.render.json` | *side-car* bukti render (engine, hash, probe) |
 | `output_ready/youtube_publish_receipt.json` | receipt upload (live atau simulasi) |
+| `workspace/pipeline_state.json` | status pipeline untuk gate `n100n` (§7b) |
 
 ---
 
@@ -166,6 +175,13 @@ Semua lewat environment (atau `.env`, dimuat otomatis):
 | `STUDIO_REMOTION_DIR` | — | Folder repo Remotion KRA untuk intro/B-roll |
 | `STUDIO_REMOTION_COMPOSITION` | — | Nama composition default |
 | `STUDIO_BGM` | — | Musik latar (dicampur −24 dB) |
+| **Suara narasi (faceless)** | | |
+| `STUDIO_TTS_PROVIDER` | `auto` | `auto`/`elevenlabs`/`edge`/`off` |
+| `STUDIO_ELEVENLABS_API_KEY` | — | Kunci ElevenLabs (fallback: `ELEVENLABS_API_KEY`) |
+| `STUDIO_ELEVENLABS_VOICE_ID` | `pNInz6obpgDQGcFmaJgB` | Voice ElevenLabs |
+| `STUDIO_EDGE_TTS_VOICE` | `id-ID-ArdiNeural` | Suara Edge-TTS (`id-ID-GadisNeural` untuk wanita) |
+| `STUDIO_TTS_RATE` | `+5%` | Kecepatan bicara TTS |
+| `STUDIO_REQUIRE_AROLL` | `1` | `0` = faceless: jangan tunggu rekaman Creator |
 | **Riset tren (Vito)** | | |
 | `STUDIO_YOUTUBE_API_KEY` | — | YouTube Data API v3 (API key saja, tanpa OAuth) |
 | `TAVILY_API_KEY` | — | Fallback tren web |
@@ -295,8 +311,9 @@ Yang terjadi per scene (semua tercatat di `.render.json`):
 
 | Tahap | Detail |
 |---|---|
-| Whisper | `word_timestamps=True` → `[{word, start, end}]`; `durationInSeconds = max(end)` |
-| Stage aset | file disalin ke `remotion_studio/public/kra_temp/` — Chromium Remotion menolak `file://`, ini yang membuat `staticFile()` aman |
+| Sumber suara | `CREATOR_AROLL` + file ada → audio/rekaman Creator; selain itu → TTS (`audioSrc`) |
+| Whisper | `word_timestamps=True` → `[{word, start, end}]`; `durationInSeconds = max(end) + 0.35` |
+| Stage aset | video, gambar latar, dan audio TTS disalin ke `remotion_studio/public/kra_temp/` — Chromium Remotion menolak `file://`, ini yang membuat `staticFile()` aman |
 | Render | `npx remotion render <composition_id> out.mp4 --props=workspace/props_<nn>_<scene>.json` |
 | Concat | `npx ffmpeg-concat -t directionalWarp` (via `xvfb-run` bila headless), fallback demuxer ffmpeg dengan `-c copy` |
 | Bersih | `public/kra_temp/` dikosongkan setelah selesai |
@@ -311,12 +328,15 @@ Dua masalah klasik ikut diselesaikan:
 Template komponennya ada di [`remotion_template/`](remotion_template) —
 `Root.tsx` (composition `StoryScene` **dan** `CreatorOverlay`) dan `StoryScene.tsx`
 (caption per kata, highlight dari Clara, lower third, tahan kata terakhir 0.25 s agar
-caption tidak berkedip). Salin ke `remotion_studio/src/`, lalu set
+caption tidak berkedip). Komponen itu menerima **salah satu** `videoSrc` (A-Roll/B-Roll)
+**atau** `audioSrc` (narasi TTS, video otomatis di-*mute*) plus `bgImageSrc` opsional
+dengan Ken Burns. Salin ke `remotion_studio/src/`, lalu set
 `STUDIO_REMOTION_DIR`.
 
-Bila Node/Remotion belum siap, setiap scene tetap dirender dengan FFmpeg
-(conform 1080p + burn-in SRT) dan laporan menyebut `engine: "ffmpeg-fallback"` —
-Raka wajib mengatakannya di ruang rapat, bukan mengaku sudah memakai Remotion.
+Bila Node/Remotion belum siap, setiap scene tetap dirender dengan FFmpeg (conform
+1080p, audio Creator/TTS dipetakan langsung, burn-in SRT bila kata Whisper tersedia)
+dan laporan menyebut `engine: "ffmpeg-fallback"` — Raka wajib mengatakannya di ruang
+rapat, bukan mengaku sudah memakai Remotion.
 
 ---
 
@@ -406,8 +426,11 @@ python virtual_office_superbots.py --serve --host 0.0.0.0 --port 8100
 | Endpoint | Fungsi |
 |---|---|
 | `POST /kra/n100n-trigger` | fase `IDEATION_SCRIPT` atau `PRODUCE_AND_UPLOAD` |
+| `POST /kra/schedule/1-start-script` | **loop 1** (08:00): rapat naskah Vito → Clara → Damon → Bima |
+| `GET /kra/schedule/2-check-gate` | **loop 2** (tiap 30 menit): sudah boleh render? |
+| `POST /kra/schedule/3-produce-and-upload` | Raka render → Damon QC → Sora upload |
 | `GET /health` | hidup + kapabilitas media (`ffmpeg`, `whisper`, `remotion`) |
-| `GET /status` | antrean, job terakhir, isi memori, file yang menunggu |
+| `GET /status` | antrean, job terakhir, isi memori, status pipeline |
 | `GET /jobs/{id}` | detail satu job |
 
 Payload & contoh (sama dengan `kra_raka_engine.py` milik KRA):
@@ -447,6 +470,106 @@ syntax error, `whisper.utils.get_writer(...)` berubah antar versi (di sini SRT d
 sendiri dari `segments`), dan argumen `--margin 0.15sec,0.25sec` serta `volume=-24dB`
 tergantung versi binary. Engine baru juga menandai setiap langkah yang dilewati/gagal,
 sesuatu yang tidak dilakukan skrip asli.
+
+---
+
+## 7b. Mode faceless & scheduler dual-loop
+
+Pipeline bisa berjalan **tanpa satu pun sentuhan manusia**: Clara menulis naskah, mesin
+TTS mengisi suara, Whisper menyelaraskan caption, Remotion merakit, Sora mengunggah.
+
+```bash
+# sekali jalan tanpa rekaman Creator
+python virtual_office_superbots.py -t "Kenapa startup AI butuh content engine" --faceless
+```
+
+atau lewat `.env`: `STUDIO_REQUIRE_AROLL=0`. Bila `--faceless` aktif, Bima tidak pernah
+menagih file, dan status pipeline langsung `READY_FOR_RENDER`.
+
+### Mesin TTS (`studio/tts.py`)
+
+| Urutan | Engine | Syarat | Catatan |
+|---|---|---|---|
+| 1 | **ElevenLabs** | `STUDIO_ELEVENLABS_API_KEY` | `eleven_multilingual_v2`, HTTP pakai `urllib` (tanpa SDK) |
+| 2 | **Edge-TTS** | `pip install edge-tts` | gratis, `id-ID-ArdiNeural` / `id-ID-GadisNeural` |
+| — | gagal semua | — | `TTSError` → scene ditandai `audio_provider: ""`, dilaporkan, tidak dipalsukan |
+
+Setelah tersedia, audio **dinormalisasi** dengan FFmpeg
+`silenceremove + loudnorm=I=-14:TP=-1.5:LRA=11` → 48 kHz stereo 192 kbps sebelum masuk
+Whisper/Remotion.
+
+```env
+STUDIO_TTS_PROVIDER=auto            # auto | elevenlabs | edge | off
+STUDIO_ELEVENLABS_API_KEY=xi-...
+STUDIO_ELEVENLABS_VOICE_ID=pNInz6obpgDQGcFmaJgB
+STUDIO_EDGE_TTS_VOICE=id-ID-ArdiNeural
+STUDIO_TTS_RATE=+5%
+```
+
+Per scene, `StoryBuilder` memilih sumber suara:
+
+1. `type: "CREATOR_AROLL"` **dan** file ada → pakai rekaman Creator (audio asli).
+2. Selain itu → narasi TTS dari `narration_text` → Whisper → props `audioSrc`.
+3. `audioSrc` terisi ⟹ `StoryScene` memutar `<Audio>` dan mem-*mute* video latar,
+   caption per kata tetap jalan, latar tanpa video memakai `bgImageSrc` + Ken Burns
+   (atau gradien gelap bila gambar juga tidak ada).
+
+### Status pipeline (`workspace/pipeline_state.json`)
+
+```
+IDLE → SCRIPTING_IN_PROGRESS → WAITING_FOR_CREATOR → RENDERING → PUBLISHED_COMPLETE
+                    ↘ READY_FOR_RENDER ↗                    ↘ ERROR
+```
+
+Ditulis **atomik** (`os.replace`), jadi `n100n` tidak pernah membaca JSON setengah jadi.
+`GET /kra/schedule/2-check-gate` menjawab satu pertanyaan saja:
+
+```json
+{"pipeline_status": "WAITING_FOR_CREATOR", "creator_file_detected": true,
+ "ready_to_produce": true, "expected_file": "a_roll_raw.mp4",
+ "reason": "rekaman Creator sudah masuk", "updated_at": "2026-11-07T08:34:12+07:00"}
+```
+
+`ready_to_produce` bernilai `true` hanya jika `WAITING_FOR_CREATOR` + file ada (bukan 0
+byte) **atau** status `READY_FOR_RENDER` (faceless). Status `SCRIPTING_IN_PROGRESS`,
+`RENDERING`, `PUBLISHED_COMPLETE`, dan `ERROR` selalu `false` — render tidak pernah
+tumpang tindih, dan file yang sudah dirender dipindahkan ke
+`input_creator/processed/` supaya tidak diproses dua kali.
+
+### Workflow n8n
+
+Import `schedules/kra_autonomous_workflow.json` (n8n → *Workflows* → *Import from
+File*), timezone `Asia/Jakarta`:
+
+| Node | Pemicu | Aksi |
+|---|---|---|
+| 08:00 AM - Jadwal Rapat Script | cron `0 8 * * *` | `POST /kra/schedule/1-start-script` |
+| Setiap 30 Menit - Cek Folder Creator | interval 30 menit | `GET /kra/schedule/2-check-gate` |
+| Apakah File Creator Siap? | IF `ready_to_produce` | true → produksi, false → tunggu |
+| Eksekusi Raka & Sora | cabang true | `POST /kra/schedule/3-produce-and-upload` |
+
+Server tetap hidup lewat pm2 (setara `uvicorn kra_n100n_server:app`, di repo ini
+aplikasinya adalah `studio/api.py`):
+
+```bash
+pm2 start "/opt/kantor-rama-ai/.venv/bin/python virtual_office_superbots.py --serve --port 8100" \
+    --name "kra-superbots-api" --cwd /opt/kantor-rama-ai
+pm2 save && pm2 startup
+pm2 logs kra-superbots-api
+```
+
+`--serve` menjalankan daemon penuh (worker + watcher + scheduler + bridge), jadi satu
+proses menangani webhook sekaligus memantau folder `input_creator/`.
+
+**Contoh siklus sehari**
+
+1. 08:00 — loop 1: Vito riset tren, Clara menulis `script_production.json`, Damon audit,
+   Bima menutup rapat. Status: `WAITING_FOR_CREATOR`.
+2. 08:30 — loop 2: file belum ada → `ready_to_produce: false`, tidak ada yang terjadi.
+3. 11:07 — Anda menaruh `a_roll_raw.mp4`; karena `--serve` juga menjalankan watcher,
+   produksi bisa terpicu tanpa n8n sama sekali.
+4. 11:30 — loop 2: `ready_to_produce: true` → Raka render (scene A-Roll + scene TTS),
+   concat, Damon QC, Sora upload. Status: `PUBLISHED_COMPLETE`, file mentah diarsipkan.
 
 ---
 
@@ -513,16 +636,19 @@ studio/
   office.py                   # spesifikasi bot, graf transisi per fase, GroupChat
   media.py                    # pipeline ffmpeg/auto-editor/Whisper/Remotion + ffprobe
   story.py                    # jembatan JSON: naskah Clara → Whisper → Remotion → concat
+  tts.py                      # voiceover faceless: ElevenLabs → Edge-TTS → loudnorm -14 LUFS
+  state.py                    # pipeline_state.json atomik + gate untuk scheduler n100n
   research.py                 # tren nyata: YouTube Data API, Tavily, SerpAPI
   memory.py                   # SQLite: runs, videos, topics, prompt_context()
   notify.py                   # Telegram Bot API (urllib) + konsol
   daemon.py                   # antrean job, watcher, scheduler, perintah Telegram
-  api.py                      # FastAPI: /kra/n100n-trigger, /health, /status
+  api.py                      # FastAPI: /kra/schedule/1..3, /kra/n100n-trigger, /health, /status
   report.py                   # transkrip & ringkasan run
   rehearsal.py                # pipeline deterministik tanpa LLM
 agents/*.md                   # persona 6 bot
 remotion_template/            # Root.tsx + StoryScene.tsx untuk kantor-rama-ai/remotion_studio
-tests/                        # 103 test: unit, daemon, API, story, e2e GroupChat dengan LLM palsu
+schedules/                    # kra_autonomous_workflow.json (n8n dual-loop, Asia/Jakarta)
+tests/                        # 138 test: unit, daemon, API, story, TTS, state, e2e GroupChat
 requirements-daemon.txt       # fastapi + uvicorn (mode --serve)
 requirements-media.txt        # openai-whisper (+ catatan ffmpeg/auto-editor/remotion)
 ```
@@ -557,7 +683,7 @@ tetap macet, `max_round` menghentikannya dan laporan berstatus
 
 ```bash
 pip install -r requirements-dev.txt
-pytest            # 103 test
+pytest            # 138 test
 ruff check .
 ```
 
@@ -567,9 +693,11 @@ ruff check .
 - `tests/test_media.py` — deteksi kapabilitas, langkah yang gagal **dilaporkan** bukan disembunyikan, SRT/subtitle filter.
 - `tests/test_memory.py` — upsert run, performa video, konteks memori, persistensi antar-proses.
 - `tests/test_daemon.py` — jadwal, watcher (file muncul sekali), antrean job, resume, perintah Telegram, shutdown.
-- `tests/test_api.py` — webhook n100n: 202, 409, 422, sanitasi path.
+- `tests/test_api.py` — webhook n100n: 202, 409, 422, sanitasi path; plus dual-loop `/kra/schedule/1..3`.
 - `tests/test_research.py` — parsing YouTube/Tavily, fallback antar-provider, dan perilaku jujur tanpa kredensial.
-- `tests/test_story.py` — validasi skema naskah, ekstraksi kata Whisper, staging `kra_temp`, render Remotion (npx palsu), concat, dan fallback FFmpeg.
+- `tests/test_story.py` — validasi skema naskah, ekstraksi kata Whisper, staging `kra_temp`, render Remotion (npx palsu), concat, fallback FFmpeg, dan narasi TTS faceless.
+- `tests/test_tts.py` — ElevenLabs (transport palsu), fallback Edge-TTS, normalisasi loudnorm, dan kegagalan yang dilaporkan jujur.
+- `tests/test_state.py` — transisi status atomik dan matriks `gate()` (file, 0 byte, busy, faceless).
 - `tests/test_group_chat_e2e.py` — **GroupChat sungguhan** dengan `OpenAIWrapper.create`
   yang dipalsukan: membuktikan tool dieksekusi oleh bot yang tepat, loop
   Damon-menolak-Clara berjalan, dan rapat berhenti karena `PIPELINE_COMPLETE`, bukan
@@ -601,6 +729,12 @@ dijawab deterministik, tetapi seluruh mesin AutoGen tetap berjalan.
 | `remotion gagal` di laporan scene | Cek `STUDIO_REMOTION_DIR` menunjuk repo Remotion, `npx remotion` bisa jalan, dan `composition_id` terdaftar di `Root.tsx` |
 | Video hitam / caption kosong | `words` kosong berarti Whisper tidak jalan; scene tetap dirender tanpa caption. Cek `engine` di `.render.json` |
 | `kra_temp` menumpuk | Normalnya dibersihkan setelah build; sisa file muncul hanya bila proses mati di tengah render |
+| `TTS gagal: edge-tts belum terpasang` | `pip install edge-tts`, atau isi `STUDIO_ELEVENLABS_API_KEY`. Tanpa keduanya scene jadi bisu — laporan menyebut `audio_provider: ""`, bukan suara palsu |
+| Suara TTS terlalu cepat/lambat | Atur `STUDIO_TTS_RATE` (mis. `+0%`, `-5%`); Edge-TTS memakai format persen bertanda |
+| ElevenLabs balas 401/429 | Kuota/kunci salah; pipeline otomatis jatuh ke Edge-TTS dan mencatatnya di `attempts` |
+| Caption tidak sinkron dengan narasi | Whisper harus jalan (`pip install -r requirements-media.txt`); tanpa Whisper `words` kosong dan caption hilang |
+| `ready_to_produce` selalu false | Cek `pipeline_status`: `SCRIPTING_IN_PROGRESS`/`RENDERING` = sibuk, `PUBLISHED_COMPLETE`/`ERROR` = tunggu jadwal 08:00 berikutnya |
+| Video Creator diproses dua kali | Seharusnya tidak terjadi: file diarsipkan ke `input_creator/processed/`. Hapus `workspace/pipeline_state.json` hanya bila status tertinggal setelah crash |
 
 ---
 

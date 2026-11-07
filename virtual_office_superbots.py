@@ -47,6 +47,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-rounds", type=int, help="Batas putaran group chat (default 40).")
     parser.add_argument("--mock-creator", action="store_true", help="Buat file A-Roll dummy otomatis.")
     parser.add_argument("--real-render", action="store_true", help="Pakai ffmpeg asli (bukan file dummy).")
+    parser.add_argument(
+        "--faceless",
+        action="store_true",
+        help="Mode faceless: tanpa rekaman Creator, narasi memakai TTS (ElevenLabs/Edge).",
+    )
     parser.add_argument("--doctor", action="store_true", help="Cek konfigurasi + kapabilitas media lalu keluar.")
     parser.add_argument("--status", action="store_true", help="Tampilkan antrean daemon + memori lalu keluar.")
     parser.add_argument(
@@ -134,6 +139,11 @@ def doctor(settings) -> int:
     print(f"  remotion      : {'siap' if (caps.npx and settings.remotion_dir) else 'tidak siap'}")
     print(f"  real render   : {'AKTIF' if settings.real_render else 'nonaktif (output simulasi)'}")
     print(f"  async gate    : {'AKTIF (tanpa input terminal)' if settings.async_gate else 'nonaktif (interaktif)'}")
+    print(f"  mode produksi : {'faceless (TTS)' if not settings.require_creator_aroll else 'butuh A-Roll Creator'}")
+    from studio.tts import resolve_provider
+
+    print(f"  mesin TTS     : {resolve_provider(settings)} (permintaan: {settings.tts_provider})")
+    print(f"  suara Edge    : {settings.edge_tts_voice} (rate {settings.tts_rate})")
     print(f"  jadwal ideasi : {settings.schedule or 'nonaktif'}")
     print(f"  notifikasi    : {'telegram' if settings.telegram_token and settings.telegram_chat_id else 'konsol'}")
     print(f"  client_secret : {'ada' if (settings.paths.root / 'client_secret.json').exists() else 'tidak ada (upload simulasi)'}")
@@ -180,6 +190,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     if args.schedule is not None:
         settings = settings.with_changes(schedule=args.schedule)
+    if args.faceless:
+        settings = settings.with_changes(require_creator_aroll=False)
     settings.paths.ensure()
 
     if args.doctor:
@@ -205,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
     from studio.office import build_office
 
     try:
-        office = build_office(settings)
+        office = build_office(settings, require_creator_aroll=settings.require_creator_aroll)
     except RuntimeError as exc:
         print(f"❌ {exc}\n")
         return 2
@@ -244,7 +256,9 @@ def run_long_lived(settings, args) -> int:
     print(daemon.status_text() + "\n")
 
     if args.topic:
-        job = daemon.submit_ideation(args.topic, source="cli")
+        job = daemon.submit_ideation(
+            args.topic, source="cli", require_aroll=settings.require_creator_aroll
+        )
         print(f"🧠 Job ideasi awal diantrekan: {job.id}\n")
 
     if args.serve:

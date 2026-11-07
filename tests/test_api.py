@@ -107,3 +107,76 @@ def test_job_detail_and_status(client) -> None:
     status = test_client.get("/status")
     assert status.status_code == 200
     assert status.json()["queue"] >= 1
+
+
+# ------------------------------------------------- dual-loop n100n (1/2/3)
+def test_start_script_marks_state_and_blocks_double_trigger(client) -> None:
+    test_client, daemon = client
+    body = {"topic_hint": "Tren AI untuk UMKM", "require_creator_aroll": True}
+    first = test_client.post("/kra/schedule/1-start-script", json=body)
+    assert first.status_code == 202
+    payload = first.json()
+    assert payload["status"] == "STARTED"
+    assert payload["phase"] == "IDEATION_SCRIPT"
+    assert payload["mode"] == "creator_aroll"
+    assert daemon.state.status() == "SCRIPTING_IN_PROGRESS"
+
+    second = test_client.post("/kra/schedule/1-start-script", json=body)
+    assert second.status_code == 409
+    assert "sibuk" in second.json()["detail"]
+
+
+def test_faceless_cycle_needs_no_creator_file(client) -> None:
+    test_client, daemon = client
+    test_client.post(
+        "/kra/schedule/1-start-script",
+        json={"topic_hint": "Faceless", "require_creator_aroll": False},
+    )
+    assert daemon.state.read()["details"]["require_creator_aroll"] is False
+
+    daemon.state.update("READY_FOR_RENDER", script_file="script_production.json")
+    gate = test_client.get("/kra/schedule/2-check-gate").json()
+    assert gate["ready_to_produce"] is True
+    assert gate["creator_file_detected"] is False
+    assert "faceless" in gate["reason"]
+
+    started = test_client.post("/kra/schedule/3-produce-and-upload")
+    assert started.status_code == 202
+    payload = started.json()
+    assert payload["status"] == "PRODUCTION_STARTED"
+    assert payload["mode"] == "faceless_tts"
+    assert daemon.state.status() == "RENDERING"
+
+    again = test_client.post("/kra/schedule/3-produce-and-upload")
+    assert again.status_code == 202
+    assert again.json()["status"] == "ALREADY_RUNNING"
+
+
+def test_gate_waits_until_creator_drops_file(client, settings: Settings) -> None:
+    test_client, daemon = client
+    daemon.state.update("WAITING_FOR_CREATOR", expected_file="a_roll_raw.mp4")
+
+    waiting = test_client.get("/kra/schedule/2-check-gate?expected_file=a_roll_raw.mp4").json()
+    assert waiting["ready_to_produce"] is False
+    assert waiting["expected_file"] == "a_roll_raw.mp4"
+
+    blocked = test_client.post("/kra/schedule/3-produce-and-upload?raw_video_filename=a_roll_raw.mp4")
+    assert blocked.status_code == 409
+
+    _video(settings)
+    ready = test_client.get("/kra/schedule/2-check-gate").json()
+    assert ready["ready_to_produce"] is True
+    assert ready["creator_file_detected"] is True
+
+    started = test_client.post("/kra/schedule/3-produce-and-upload")
+    assert started.status_code == 202
+    assert started.json()["mode"] == "creator_aroll"
+
+
+def test_produce_rejected_while_rendering(client, settings: Settings) -> None:
+    test_client, daemon = client
+    _video(settings)
+    daemon.state.update("RENDERING", job_id="job-lain")
+    response = test_client.post("/kra/schedule/3-produce-and-upload")
+    assert response.status_code == 409
+    assert "sibuk" in response.json()["detail"]

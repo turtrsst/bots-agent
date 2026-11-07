@@ -78,7 +78,7 @@ def test_text_only_scene_is_a_warning_not_an_error() -> None:
     data["scenes"][0].pop("broll_asset")
     report = validate_story(data)
     assert report.ok
-    assert any("teks saja" in warning for warning in report.warnings)
+    assert any("tanpa aset visual" in warning for warning in report.warnings)
 
 
 # ----------------------------------------------------------------- whisper
@@ -271,3 +271,114 @@ def test_tool_without_script_explains_what_is_missing(
     result = tools.assemble_story_from_script()
     assert result.startswith("ERROR RENDER")
     assert SCENE_FILENAME in result
+
+
+# ------------------------------------------------------- mode faceless (TTS)
+FACELESS = {
+    "project_id": "story_faceless_001",
+    "title": "Kantor yang Tidak Pernah Tidur",
+    "fps": 30,
+    "scenes": [
+        {
+            "scene_id": "scene_1_hook",
+            "type": "REMOTION_DYNAMIC",
+            "composition_id": "StoryScene",
+            "narration_text": "Kantor ini tutup pukul lima, tapi videonya tidak pernah tidur.",
+            "visual_cue": "Dark server room with neon lights",
+            "bg_image": "bg_office.jpg",
+            "highlight_words": ["tidak pernah tidur"],
+        }
+    ],
+}
+
+
+def _fake_tts(monkeypatch: pytest.MonkeyPatch, *, fail: bool = False) -> list[dict]:
+    from studio.tts import Narration
+
+    calls: list[dict] = []
+
+    def tts(settings, text, workdir, **kwargs):
+        calls.append({"text": text, **kwargs})
+        if fail:
+            from studio.tts import TTSError
+
+            raise TTSError("semua engine TTS gagal: edge-tts belum terpasang")
+        target = Path(workdir) / f"tts_norm_{kwargs['scene_id']}.mp3"
+        target.write_bytes(b"ID3tts")
+        return Narration(provider="edge", path=target, notes=["narasi: edge"])
+
+    return calls, tts
+
+
+def test_faceless_scene_narrates_with_tts(
+    story_settings: Settings, fake_ffmpeg: Path, fake_npx: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("studio.story.shutil.which", lambda _name: None)
+    caps = Capabilities(ffmpeg=str(fake_ffmpeg), npx=str(fake_npx), remotion_dir=str(story_settings.remotion_dir))
+    (story_settings.paths.input_creator / "bg_office.jpg").write_bytes(b"jpg")
+    script_path = _write_story(story_settings, FACELESS)
+    calls, tts = _fake_tts(monkeypatch)
+    builder = StoryBuilder(story_settings, caps, tts=tts)
+    monkeypatch.setattr(
+        builder,
+        "words_for",
+        lambda _source: ([{"word": "tidak", "start": 0.2, "end": 0.6}, {"word": "tidur", "start": 0.7, "end": 1.9}], 1.9),
+    )
+
+    result = builder.build(script_path, story_settings.paths.output_ready / "final.mp4")
+
+    assert result.ok
+    assert calls and calls[0]["scene_id"] == "scene_1_hook"
+    assert calls[0]["text"].startswith("Kantor ini tutup")
+    scene = result.scenes[0]
+    assert scene.audio_provider == "edge"
+    assert scene.audio.endswith("tts_norm_scene_1_hook.mp3")
+    assert result.tts_providers == ["edge"]
+    props_path = next(story_settings.paths.workspace.glob("props_*_scene_1_hook.json"))
+    props = json.loads(props_path.read_text(encoding="utf-8"))
+    assert props["audioSrc"] == "scene_1_hook__tts_norm_scene_1_hook.mp3"
+    assert props["bgImageSrc"].startswith("scene_1_hook__")
+    assert props["videoSrc"] == ""
+    assert [word["word"] for word in props["words"]] == ["tidak", "tidur"]
+    assert props["durationInSeconds"] == pytest.approx(1.9 + 0.35)
+    assert list((Path(story_settings.remotion_dir) / "public" / "kra_temp").iterdir()) == []
+
+
+def test_tts_failure_is_reported_not_faked(
+    story_settings: Settings, fake_ffmpeg: Path, fake_npx: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("studio.story.shutil.which", lambda _name: None)
+    caps = Capabilities(ffmpeg=str(fake_ffmpeg), npx=str(fake_npx), remotion_dir=str(story_settings.remotion_dir))
+    script_path = _write_story(story_settings, FACELESS)
+    _calls, tts = _fake_tts(monkeypatch, fail=True)
+
+    result = StoryBuilder(story_settings, caps, tts=tts).build(
+        script_path, story_settings.paths.output_ready / "final.mp4"
+    )
+
+    scene = result.scenes[0]
+    assert scene.audio_provider == ""
+    assert any("TTS gagal" in note for note in scene.notes)
+    assert result.tts_providers == []
+    props_path = next(story_settings.paths.workspace.glob("props_*_scene_1_hook.json"))
+    props = json.loads(props_path.read_text(encoding="utf-8"))
+    assert props["audioSrc"] == ""
+
+
+def test_creator_aroll_scene_skips_tts(
+    story_settings: Settings, fake_ffmpeg: Path, fake_npx: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("studio.story.shutil.which", lambda _name: None)
+    caps = Capabilities(ffmpeg=str(fake_ffmpeg), npx=str(fake_npx), remotion_dir=str(story_settings.remotion_dir))
+    _assets(story_settings)
+    script_path = _write_story(story_settings)
+    calls, tts = _fake_tts(monkeypatch)
+
+    result = StoryBuilder(story_settings, caps, tts=tts).build(
+        script_path, story_settings.paths.output_ready / "final.mp4"
+    )
+
+    assert [call["scene_id"] for call in calls] == ["scene_1_hook"]  # scene A-Roll tidak di-TTS
+    aroll = result.scenes[1]
+    assert aroll.audio_provider == ""
+    assert aroll.audio == ""

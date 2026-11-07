@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import shutil
 import time
 import uuid
 from collections.abc import Callable
@@ -30,6 +31,16 @@ from .media import Capabilities, detect_capabilities
 from .memory import MemoryStore, new_run_id
 from .notify import Notifier, build_notifier, format_job_result
 from .office import RunSummary, build_office
+from .state import (
+    BUSY,
+    ERROR,
+    PUBLISHED,
+    READY_RENDER,
+    RENDERING,
+    SCRIPTING,
+    WAITING_CREATOR,
+    PipelineState,
+)
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".m4v", ".webm", ".avi"}
 PHASES = ("ideation", "production")
@@ -90,6 +101,7 @@ class Job:
     status_detail: str = ""
     youtube_url: str = ""
     error: str = ""
+    require_aroll: bool = True
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -100,6 +112,7 @@ class Job:
             "source": self.source,
             "status": self.status,
             "status_detail": self.status_detail,
+            "require_aroll": self.require_aroll,
             "run_id": self.run_id,
             "youtube_url": self.youtube_url,
             "error": self.error,
@@ -120,11 +133,13 @@ class Daemon:
         memory: MemoryStore | None = None,
         office_factory: Callable[..., Any] | None = None,
         clock: Callable[[], datetime] | None = None,
+        state: PipelineState | None = None,
     ) -> None:
         self.settings = settings
         settings.paths.ensure()
         self.notifier = notifier or build_notifier(settings)
         self.memory = memory or MemoryStore(settings.memory_db_path)
+        self.state = state or PipelineState(settings.paths.pipeline_state)
         self.office_factory = office_factory or build_office
         self.clock = clock or (lambda: datetime.now().astimezone())
 
@@ -146,7 +161,15 @@ class Daemon:
         return self._caps
 
     # ---------------------------------------------------------------- submit
-    def _new_job(self, phase: str, *, topic: str = "", raw_file: str = "", source: str = "cli") -> Job:
+    def _new_job(
+        self,
+        phase: str,
+        *,
+        topic: str = "",
+        raw_file: str = "",
+        source: str = "cli",
+        require_aroll: bool = True,
+    ) -> Job:
         if phase not in PHASES:
             raise ValueError(f"phase '{phase}' tidak dikenal")
         job = Job(
@@ -155,6 +178,7 @@ class Daemon:
             topic=topic,
             raw_file=raw_file,
             source=source,
+            require_aroll=require_aroll,
         )
         self.jobs[job.id] = job
         if len(self.jobs) > 50:
@@ -163,11 +187,37 @@ class Daemon:
         self.queue.put_nowait(job)
         return job
 
-    def submit_ideation(self, topic: str, *, source: str = "cli") -> Job:
-        return self._new_job("ideation", topic=topic.strip(), source=source)
+    def submit_ideation(self, topic: str, *, source: str = "cli", require_aroll: bool = True) -> Job:
+        job = self._new_job(
+            "ideation", topic=topic.strip(), source=source, require_aroll=require_aroll
+        )
+        self.state.update(
+            SCRIPTING,
+            topic=job.topic,
+            job_id=job.id,
+            require_creator_aroll=require_aroll,
+            source=source,
+        )
+        return job
 
-    def submit_production(self, raw_file: str, *, source: str = "watcher", topic: str = "") -> Job:
-        return self._new_job("production", topic=topic, raw_file=str(raw_file), source=source)
+    def active_job(self, phase: str | None = None) -> Job | None:
+        """Job yang sedang berjalan/menunggu — dipakai untuk idempotensi webhook."""
+        for job in self.jobs.values():
+            if job.status in {"queued", "running"} and (phase is None or job.phase == phase):
+                return job
+        return None
+
+    def submit_production(
+        self, raw_file: str, *, source: str = "watcher", topic: str = "", dedupe: bool = True
+    ) -> Job:
+        """Antrekan produksi; `dedupe` mencegah n100n memicu render berkali-kali."""
+        if dedupe:
+            running = self.active_job("production")
+            if running is not None:
+                return running
+        job = self._new_job("production", topic=topic, raw_file=str(raw_file), source=source)
+        self.state.update(RENDERING, raw_file=Path(raw_file).name, job_id=job.id, source=source)
+        return job
 
     # ---------------------------------------------------------------- status
     def status(self) -> dict[str, Any]:
@@ -181,6 +231,7 @@ class Daemon:
             "pending_files": sorted(path.name for path in self._video_files()),
             "schedule": self.settings.schedule,
             "notifier": type(self.notifier).__name__,
+            "pipeline_state": self.state.read(),
         }
 
     def status_text(self) -> str:
@@ -189,6 +240,7 @@ class Daemon:
         lines = [
             "📊 STATUS STUDIO",
             f"Daemon: {'jalan' if data['running'] else 'berhenti'} | antrean: {data['queue']}",
+            f"Pipeline: {self.state.as_text()}",
             f"Job aktif: {(data['current_job'] or {}).get('id', '-')}",
             f"Memori: {data['memory']['runs']} rapat, {data['memory']['videos']} video, "
             f"{data['memory']['awaiting_creator']} menunggu rekaman",
@@ -284,6 +336,7 @@ class Daemon:
             job.error = f"{type(exc).__name__}: {exc}"
             job.status = "failed"
             job.finished_at = time.time()
+            self.state.update(ERROR, job_id=job.id, phase=job.phase, error=job.error)
             await asyncio.to_thread(
                 self.notifier.send, f"❌ Job {job.id} gagal\nTopik: {job.topic or '-'}\n{job.error}"
             )
@@ -306,8 +359,12 @@ class Daemon:
     # -------------------------------------------------------------- fase kerja
     def _run_ideation(self, job: Job) -> RunSummary:
         office = self.office_factory(
-            self.settings, stage="ideation", memory_context=self.memory.prompt_context()
+            self.settings,
+            stage="ideation",
+            memory_context=self.memory.prompt_context(),
+            require_creator_aroll=job.require_aroll,
         )
+        self.state.update(SCRIPTING, job_id=job.id, topic=job.topic, run_id=job.run_id or None)
         summary = office.run(job.topic)
 
         run_id = new_run_id()
@@ -323,24 +380,50 @@ class Daemon:
             meta={"rounds": summary.rounds, "source": job.source, "model": self.settings.model},
         )
 
-        if summary.awaiting_creator:
-            self.notifier.send(self._creator_checklist(summary, job))
-        elif summary.completed:
-            self.notifier.send(
-                format_job_result(
-                    title="Rapat ideasi selesai",
-                    status=summary.status,
-                    topic=job.topic,
-                    files=summary.files,
-                )
+        if summary.awaiting_creator and job.require_aroll:
+            self.state.update(
+                WAITING_CREATOR,
+                run_id=run_id,
+                job_id=job.id,
+                expected_file="a_roll_raw.mp4",
+                script_file="script_production.json",
             )
-        else:
+            self.notifier.send(self._creator_checklist(summary, job))
+        elif job.require_aroll and not summary.completed and not summary.awaiting_creator:
+            self.state.update(
+                ERROR,
+                run_id=run_id,
+                job_id=job.id,
+                error=f"ideasi berhenti: {summary.status}",
+            )
             self.notifier.send(
                 format_job_result(
                     title="Rapat ideasi berhenti",
                     status=summary.status,
                     topic=job.topic,
                     note="Cek workspace/run_transcript.md untuk melihat titik macetnya.",
+                )
+            )
+        else:
+            # Faceless (tanpa A-Roll) atau naskah selesai → langsung siap render.
+            self.state.update(
+                READY_RENDER,
+                run_id=run_id,
+                job_id=job.id,
+                script_file="script_production.json",
+                faceless=not job.require_aroll,
+            )
+            self.notifier.send(
+                format_job_result(
+                    title="Naskah siap dirender"
+                    if not job.require_aroll
+                    else "Rapat ideasi selesai (siap produksi)",
+                    status=summary.status,
+                    topic=job.topic,
+                    files=summary.files,
+                    note="n100n boleh memicu fase produksi (mode faceless)."
+                    if not job.require_aroll
+                    else "",
                 )
             )
         return summary
@@ -353,6 +436,7 @@ class Daemon:
         job.topic = job.topic or topic
 
         raw_name = Path(job.raw_file).name
+        self.state.update(RENDERING, job_id=job.id, run_id=run_id, raw_file=raw_name)
         office = self.office_factory(
             self.settings, stage="production", memory_context=self.memory.prompt_context()
         )
@@ -373,6 +457,14 @@ class Daemon:
             self.memory.record_video(run_id, self._brief_title() or topic, summary.youtube_url)
 
         if summary.completed:
+            self.state.update(
+                PUBLISHED,
+                run_id=run_id,
+                job_id=job.id,
+                youtube_url=summary.youtube_url,
+                video="output_ready/final_render.mp4",
+            )
+            self._archive_processed(job.raw_file)
             self.notifier.send(
                 format_job_result(
                     title="✅ Video selesai diproduksi",
@@ -383,6 +475,12 @@ class Daemon:
                 )
             )
         else:
+            self.state.update(
+                ERROR,
+                run_id=run_id,
+                job_id=job.id,
+                error=f"produksi berhenti: {summary.status}",
+            )
             self.notifier.send(
                 format_job_result(
                     title="⚠️ Produksi berhenti sebelum selesai",
@@ -394,6 +492,24 @@ class Daemon:
         return summary
 
     # -------------------------------------------------------------- watcher
+    def _archive_processed(self, raw_file: str) -> Path | None:
+        """Pindahkan rekaman ke input_creator/processed/ agar tidak diproses ulang."""
+        if not raw_file:
+            return None
+        source = Path(raw_file)
+        if not source.is_absolute():
+            source = self.settings.paths.input_creator / source
+        if not source.exists():
+            return None
+        archive = self.settings.paths.processed
+        archive.mkdir(parents=True, exist_ok=True)
+        target = archive / source.name
+        if target.exists():
+            target = archive / f"{source.stem}_{datetime.now():%Y%m%d-%H%M%S}{source.suffix}"
+        shutil.move(str(source), str(target))
+        self._handled = {key for key in self._handled if not key.startswith(f"{source.resolve()}:")}
+        return target
+
     def _video_files(self) -> list[Path]:
         folder = self.settings.paths.input_creator
         if not folder.exists():
@@ -436,6 +552,9 @@ class Daemon:
             await self._sleep(self.settings.watch_interval)
 
     def _resume_pending(self) -> None:
+        if self.state.status() in BUSY:
+            # Render/ideasi lain masih jalan — jangan menumpuk job (gate atomik).
+            return
         pending = self.memory.runs_by_status("AWAITING_CREATOR_UPLOAD")
         if not pending:
             return

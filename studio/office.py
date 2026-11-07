@@ -288,8 +288,28 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
 AGENT_BY_KEY = {spec.key: spec for spec in AGENT_SPECS}
 
 
-def kickoff_message(topic: str, stage: str = "full", raw_file: str = "") -> str:
+def kickoff_message(
+    topic: str,
+    stage: str = "full",
+    raw_file: str = "",
+    require_creator_aroll: bool = True,
+) -> str:
     if stage == "ideation":
+        if not require_creator_aroll:
+            return (
+                "FASE IDEASI DIMULAI — MODE FACELESS (tanpa rekaman Creator).\n"
+                f"Topik dari Creator: '{topic}'.\n\n"
+                "1. Vito_TrendStrategist — brief + 3 judul ber-CTR tinggi → `save_content_brief`.\n"
+                "2. Clara_Scriptwriter — naskah [AI B-ROLL] dengan narration_text utuh → "
+                "`save_production_script`, lalu scene breakdown JSON → `save_scene_breakdown`. "
+                "narration_text akan disuarakan TTS dan disinkronkan Whisper, jadi tulis kalimat "
+                "yang benar-benar diucapkan.\n"
+                "3. Damon_RealityChecker — audit naskah; minta revisi bila perlu, setujui bila layak.\n"
+                "4. Bima_StudioPM — mode faceless: JANGAN menagih file rekaman dan jangan memanggil "
+                "tool penagihan. Konfirmasi naskah siap render, lalu tutup rapat dengan kata kunci "
+                "penutup yang ada di system prompt-mu.\n\n"
+                "Jangan menyuruh Raka render di fase ini."
+            )
         return (
             "FASE IDEASI DIMULAI (belum masuk produksi).\n"
             f"Topik dari Creator: '{topic}'.\n\n"
@@ -316,6 +336,21 @@ def kickoff_message(topic: str, stage: str = "full", raw_file: str = "") -> str:
             "3. Sora_YouTubePublisher — upload dengan metadata SEO + Chapters, lalu tutup rapat "
             "dengan kata kunci penutup.\n\n"
             "Jangan mengulang riset/naskah; fokus ke produksi dan publikasi."
+        )
+    if not require_creator_aroll:
+        return (
+            "PROYEK BARU DIMULAI — MODE FACELESS (tanpa rekaman Creator).\n"
+            f"Topik dari Creator: '{topic}'.\n\n"
+            "1. Vito_TrendStrategist — content brief + 3 judul → `save_content_brief`.\n"
+            "2. Clara_Scriptwriter — naskah retensi tinggi berbasis [AI B-ROLL] → "
+            "`save_production_script` + scene breakdown JSON `save_scene_breakdown`. "
+            "narration_text akan disuarakan TTS.\n"
+            "3. Damon_RealityChecker — audit naskah, setujui atau minta revisi.\n"
+            "4. Bima_StudioPM — mode faceless: konfirmasi naskah siap render, jangan menagih rekaman.\n"
+            "5. Raka_Producer — `assemble_story_from_script` (TTS + Remotion + concat).\n"
+            "6. Damon_RealityChecker — audit bukti fisik hasil render.\n"
+            "7. Sora_YouTubePublisher — upload, lalu tutup rapat dengan kata kunci penutup.\n\n"
+            "Aturan: jangan melompati tahap, jangan mengarang hasil tool, sebut nama bot tujuan."
         )
     return (
         "PROYEK BARU DIMULAI!\n"
@@ -430,6 +465,7 @@ class Office:
         manager: GroupChatManager,
         persona_sources: dict[str, Persona],
         stage: str = "full",
+        require_creator_aroll: bool = True,
     ) -> None:
         self.settings = settings
         self.tools = tools
@@ -439,13 +475,19 @@ class Office:
         self.manager = manager
         self.persona_sources = persona_sources
         self.stage = stage
+        self.require_creator_aroll = require_creator_aroll
 
     # ------------------------------------------------------------------ run
     def run(self, topic: str, *, raw_file: str = "") -> RunSummary:
         started = time.monotonic()
         self.creator.initiate_chat(
             self.manager,
-            message=kickoff_message(topic, self.stage, raw_file=raw_file),
+            message=kickoff_message(
+                topic,
+                self.stage,
+                raw_file=raw_file,
+                require_creator_aroll=self.require_creator_aroll,
+            ),
             clear_history=True,
         )
         elapsed = time.monotonic() - started
@@ -484,6 +526,7 @@ def build_office(
     *,
     stage: str = "full",
     memory_context: str = "",
+    require_creator_aroll: bool = True,
 ) -> Office:
     """Rakit 6 bot, Creator, dan GroupChat dengan tool yang sudah terpasang.
 
@@ -575,4 +618,5 @@ def build_office(
         manager=manager,
         persona_sources=persona_sources,
         stage=stage,
+        require_creator_aroll=require_creator_aroll,
     )

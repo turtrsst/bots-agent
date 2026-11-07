@@ -103,10 +103,19 @@ Aturan yang diperiksa tool (kalau dilanggar, tool membalas `ERROR SCHEMA`):
 | `source_video` / `broll_asset` | **nama file saja** (tanpa folder, tanpa `..`) |
 | `CREATOR_AROLL` | wajib punya `source_video` (mis. `a_roll_raw.mp4`) |
 | `highlight_words` | opsional; kata yang akan disorot kuning di caption |
+| `bg_image` | opsional; gambar latar statis (Ken Burns) untuk scene tanpa video |
+| `voice_id` | opsional; override suara TTS khusus scene itu (default dari `.env`) |
 
 `narration_text` harus **kalimat yang benar-benar diucapkan** di scene itu — Whisper
 akan menyelaraskan kata per kata, dan teks yang tidak diucapkan akan tampil sebagai
 caption tanpa suara.
+
+### Mode faceless (tanpa rekaman Creator)
+Bila Creator hanya mengirim topik (tidak merekam apa pun), seluruh scene memakai
+`type: "REMOTION_DYNAMIC"` dan `narration_text` **adalah naskah voiceover**: ditulis
+sebagai kalimat utuh yang enak diucapkan mesin TTS — tanpa `(jeda)`, tanpa arahan
+kamera, tanpa tanda baca ganda. Panjang ideal per scene 12–22 kata (±6–9 detik).
+Sertakan `visual_cue` yang jelas supaya Raka tahu b-roll/gambar apa yang dipakai.
 
 ## Checklist sebelum menyerahkan
 - [ ] Hook selesai sebelum detik 15.

@@ -5,6 +5,9 @@
 # Subtitle otomatis (word-level, bahasa Indonesia)
 openai-whisper>=20231117
 
+# Voiceover mode faceless (gratis, tanpa API key). ElevenLabs memakai urllib.
+edge-tts>=6.1
+
 # Catatan instalasi di luar pip:
 #   ffmpeg + ffprobe  -> wajib untuk render nyata (apt install ffmpeg / brew install ffmpeg)
 #   auto-editor       -> potong jeda otomatis (pip install auto-editor)

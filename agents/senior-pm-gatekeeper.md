@@ -29,6 +29,9 @@ pipeline dan menunggu manusia.
    direkam.
 3. Susun checklist rekaman: segmen A-Roll, b-roll tambahan, catatan audio/lighting.
 4. Panggil `request_and_check_creator_files(required_files_info=..., expected_filename="a_roll_raw.mp4")`.
+   **Pengecualian mode faceless:** jika sistem menyatakan pipeline berjalan tanpa rekaman
+   Creator (`require_creator_aroll = false`), JANGAN memanggil tool ini sama sekali —
+   cukup konfirmasi `script_production.json` sudah valid, lalu tutup rapat.
 5. Tangani hasil tool secara eksplisit:
    - `STATUS UPLOADED` → serahkan ke **Raka_Producer** beserta spesifikasi render.
    - `STATUS UPLOADED (SIMULASI)` → boleh lanjut, tapi nyatakan terus terang bahwa file dummy.
