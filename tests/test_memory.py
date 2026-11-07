@@ -82,3 +82,144 @@ def test_persistent_across_instances(settings: Settings) -> None:
     first.record_run("run-p", "Topik persist", status="PIPELINE_COMPLETE")
     second = MemoryStore(Path(settings.memory_db_path))
     assert second.get_run("run-p")["topic"] == "Topik persist"
+
+
+# ------------------------------------------------- memori episodik (SQLite)
+def _memory(tmp_path: Path):
+    from studio.memory import MemoryStore
+
+    return MemoryStore(tmp_path / "studio.db")
+
+
+def test_episode_registered_and_readable(tmp_path: Path) -> None:
+    memory = _memory(tmp_path)
+    memory.register_episode(
+        "story_kra_001",
+        topic_summary="kantor AI yang berjalan tanpa manusia",
+        primary_title="Kantor AI Tanpa Manusia",
+        keywords="ai agent, otomasi",
+        all_titles=["Kantor AI Tanpa Manusia", "Robot Kerja Malam"],
+    )
+
+    episode = memory.get_episode("story_kra_001")
+    assert episode["status"] == "SCRIPT_APPROVED"
+    assert episode["primary_title"] == "Kantor AI Tanpa Manusia"
+    assert "otomasi" in episode["keywords"]
+
+    again = memory.register_episode(
+        "story_kra_001", topic_summary="versi revisi", primary_title="Judul Revisi"
+    )
+    assert again == "story_kra_001"
+    assert len(memory.recent_episodes()) == 1  # idempoten per project_id
+    assert memory.get_episode("story_kra_001")["primary_title"] == "Judul Revisi"
+
+
+def test_similarity_math() -> None:
+    from studio.memory import token_similarity
+
+    assert token_similarity("kantor AI tanpa manusia", "kantor AI tanpa manusia") == 1.0
+    assert token_similarity("", "kantor AI") == 0.0
+    assert token_similarity("dan yang di ke", "kantor AI") == 0.0  # semua stopword
+    assert token_similarity("kantor AI manusia", "kantor pabrik robot") == 0.5  # 1 irisan / 2 token
+
+
+def test_duplicate_detection_threshold(tmp_path: Path) -> None:
+    memory = _memory(tmp_path)
+    memory.register_episode(
+        "story_kra_001",
+        topic_summary="kantor AI berjalan tanpa manusia",
+        primary_title="Kantor AI Tanpa Manusia",
+        keywords="otomasi",
+    )
+
+    duplicate = memory.check_topic_similarity("Kantor AI tanpa manusia di malam hari")
+    assert duplicate and duplicate[0]["project_id"] == "story_kra_001"
+    assert duplicate[0]["similarity"] >= 0.55
+    assert duplicate[0]["similarity_percent"].endswith("%")
+
+    unique = memory.check_topic_similarity("Cara merawat tanaman hias di apartemen")
+    assert unique == []
+
+    strict = memory.check_topic_similarity("Kantor AI di malam hari", threshold=0.95)
+    assert strict == []
+
+
+def test_similarity_falls_back_without_fts(tmp_path: Path) -> None:
+    memory = _memory(tmp_path)
+    memory.register_episode("p1", topic_summary="kantor AI tanpa manusia", primary_title="Kantor AI")
+    memory.fts = False  # simulasi SQLite tanpa FTS5
+
+    matches = memory.check_topic_similarity("Kantor AI tanpa manusia")
+    assert matches and matches[0]["project_id"] == "p1"
+
+
+def test_episodes_text_is_honest_when_empty(tmp_path: Path) -> None:
+    text = _memory(tmp_path).episodes_text()
+    assert text.startswith("MEMORI KRA KOSONG")
+
+
+def test_mark_published_creates_and_updates(tmp_path: Path) -> None:
+    memory = _memory(tmp_path)
+    memory.register_episode("p1", topic_summary="topik", primary_title="Judul")
+    memory.mark_episode_published("p1", video_id="vid1", url="https://youtu.be/vid1")
+
+    episode = memory.get_episode("p1")
+    assert episode["status"] == "PUBLISHED"
+    assert episode["youtube_video_id"] == "vid1"
+
+    memory.mark_episode_published("p2", video_id="vid2", url="https://youtu.be/vid2", title="Episode Baru")
+    assert memory.get_episode("p2")["primary_title"] == "Episode Baru"
+    assert len(memory.recent_episodes()) == 2
+
+
+def test_sync_views_updates_counts(tmp_path: Path) -> None:
+    memory = _memory(tmp_path)
+    memory.register_episode("p1", topic_summary="topik", primary_title="Judul")
+    memory.mark_episode_published("p1", video_id="vid1", url="https://youtu.be/vid1")
+
+    calls: list[str] = []
+
+    def transport(method: str, url: str, payload=None, **_kwargs):
+        calls.append(url)
+        return {"items": [{"id": "vid1", "statistics": {"viewCount": "14200"}}]}
+
+    report = memory.sync_views("key", transport=transport)
+
+    assert report["status"] == "SYNCED"
+    assert report["updated"] == 1
+    assert report["views"] == 14200
+    assert memory.get_episode("p1")["views_count"] == 14200
+    assert "statistics" in calls[0]
+
+
+def test_sync_views_without_key_or_videos(tmp_path: Path) -> None:
+    memory = _memory(tmp_path)
+    assert memory.sync_views("")["status"] == "EMPTY"  # belum ada video live
+    memory.register_episode("p1", topic_summary="topik", primary_title="Judul")
+    memory.mark_episode_published("p1", video_id="vid1", url="https://youtu.be/vid1")
+    assert memory.sync_views("")["status"] == "NO_KEY"
+
+
+def test_sync_views_reports_errors(tmp_path: Path) -> None:
+    memory = _memory(tmp_path)
+    memory.register_episode("p1", topic_summary="topik", primary_title="Judul")
+    memory.mark_episode_published("p1", video_id="vid1", url="https://youtu.be/vid1")
+
+    def broken(*_args, **_kwargs):
+        raise OSError("kuota habis")
+
+    report = memory.sync_views("key", transport=broken)
+    assert report["status"].startswith("ERROR")
+
+
+def test_prompt_context_includes_episodes(tmp_path: Path) -> None:
+    memory = _memory(tmp_path)
+    memory.register_episode("p1", topic_summary="topik", primary_title="Kantor AI Tanpa Manusia")
+    memory.mark_episode_published("p1", video_id="v", url="https://youtu.be/v")
+    memory.sync_views("key", transport=lambda *a, **k: {"items": [{"id": "v", "statistics": {"viewCount": "900"}}]})
+
+    context = memory.prompt_context()
+    assert "Episode terakhir" in context
+    assert "Kantor AI Tanpa Manusia" in context
+    assert "900 views" in context
+    assert memory.stats()["episodes"] == 1

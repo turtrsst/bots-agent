@@ -155,7 +155,10 @@ def doctor(settings) -> int:
     print(f"  client_secret : {'ada' if (settings.paths.root / 'client_secret.json').exists() else 'tidak ada (upload simulasi)'}")
     try:
         stats = MemoryStore(settings.memory_db_path).stats()
-        print(f"  memori        : {stats['runs']} rapat, {stats['videos']} video ({stats['db']})")
+        print(
+            f"  memori        : {stats['runs']} rapat, {stats['videos']} video, "
+            f"{stats.get('episodes', 0)} episode ({stats['db']})"
+        )
     except Exception as exc:  # noqa: BLE001 - doctor tidak boleh crash
         print(f"  memori        : GAGAL dibuka ({type(exc).__name__}: {exc})")
     if parse_schedule(settings.schedule) and not settings.api_key:
@@ -170,6 +173,15 @@ def print_status(settings) -> int:
 
     daemon = Daemon(settings)
     print(daemon.status_text())
+    episodes = daemon.memory.recent_episodes(5)
+    if episodes:
+        print("\n📚 Katalog episode:")
+        for episode in episodes:
+            views = f" | {episode['views_count']} views" if episode.get("views_count") else ""
+            print(
+                f"  - {episode['created_at'][:10]} | {episode['status']:<18} | "
+                f"{(episode['primary_title'] or '')[:60]}{views}"
+            )
     runs = daemon.memory.recent_runs(5)
     if runs:
         print("\n🧠 Rapat terakhir:")

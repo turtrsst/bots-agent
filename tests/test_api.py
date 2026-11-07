@@ -180,3 +180,23 @@ def test_produce_rejected_while_rendering(client, settings: Settings) -> None:
     response = test_client.post("/kra/schedule/3-produce-and-upload")
     assert response.status_code == 409
     assert "sibuk" in response.json()["detail"]
+
+
+# ------------------------------------------------------- memori episodik
+def test_memory_endpoints(client) -> None:
+    test_client, daemon = client
+    daemon.memory.register_episode(
+        "story_kra_010", topic_summary="kantor AI", primary_title="Kantor AI Tanpa Manusia"
+    )
+
+    listing = test_client.get("/kra/memory/episodes?limit=5")
+    assert listing.status_code == 200
+    body = listing.json()
+    assert body["count"] == 1
+    assert body["episodes"][0]["project_id"] == "story_kra_010"
+    assert isinstance(body["fts"], bool)
+
+    # Tanpa YouTube API key: sinkronisasi harus menjawab jujur, bukan mengaku sukses.
+    sync = test_client.post("/kra/memory/sync-views")
+    assert sync.status_code == 200
+    assert sync.json()["status"] in {"EMPTY", "NO_KEY"}

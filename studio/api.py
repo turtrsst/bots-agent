@@ -174,6 +174,21 @@ def create_app(daemon: Daemon, *, autostart: bool = True) -> Any:
             "pipeline_status": daemon.state.status(),
         }
 
+    # ---------------------------------------------------- memori episodik
+    @app.get("/kra/memory/episodes")
+    async def memory_episodes(limit: int = 15) -> dict[str, Any]:
+        """Katalog episode terakhir (dipakai dashboard/n100n untuk audit topik)."""
+        episodes = daemon.memory.recent_episodes(limit)
+        return {"count": len(episodes), "episodes": episodes, "fts": daemon.memory.fts}
+
+    @app.post("/kra/memory/sync-views")
+    async def sync_views(limit: int = 50) -> dict[str, Any]:
+        """Tarik views terbaru dari YouTube untuk evaluasi Vito (cron mingguan n100n)."""
+        report = daemon.memory.sync_views(
+            daemon.settings.youtube_api_key, limit=max(1, min(limit, 50))
+        )
+        return {"status": report["status"], **report}
+
     # ------------------------------------------------------ endpoint tunggal
     @app.post("/kra/n100n-trigger", status_code=202)
     async def n100n_trigger(payload: N100nTriggerPayload) -> dict[str, Any]:

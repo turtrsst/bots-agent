@@ -372,6 +372,7 @@ class Daemon:
             require_creator_aroll=job.require_aroll,
         )
         self.state.update(SCRIPTING, job_id=job.id, topic=job.topic, run_id=job.run_id or None)
+        self._sync_memory_views()
         summary = office.run(job.topic)
 
         run_id = new_run_id()
@@ -507,6 +508,21 @@ class Daemon:
         return summary
 
     # -------------------------------------------------------------- watcher
+    def _sync_memory_views(self) -> None:
+        """Segarkan views_count katalog episode sebelum Vito menyusun ide baru."""
+        if not self.settings.youtube_api_key:
+            return
+        try:
+            report = self.memory.sync_views(self.settings.youtube_api_key)
+        except Exception as exc:  # noqa: BLE001 - sinkronisasi opsional
+            print(f"⚠️  Sinkronisasi views memori gagal: {type(exc).__name__}: {exc}", flush=True)
+            return
+        if report.get("status") == "SYNCED":
+            print(
+                f"📊 Memori episodik: {report['updated']} video, total {report['views']} views",
+                flush=True,
+            )
+
     def _archive_processed(self, raw_file: str) -> Path | None:
         """Pindahkan rekaman ke input_creator/processed/ agar tidak diproses ulang."""
         if not raw_file:

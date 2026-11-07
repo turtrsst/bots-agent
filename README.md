@@ -103,9 +103,9 @@ Setiap bot memegang **hanya** tool sesuai perannya. Tool yang sama tidak dibagi 
 | Bot | Peran | Tool | Menyerahkan ke |
 |---|---|---|---|
 | `Creator_Kamu` | Anda (manusia) | — | Vito |
-| `Vito_TrendStrategist` | riset tren **nyata**, judul, thumbnail | `scan_viral_trends_and_youtube_outliers`, `research_current_trends`, `save_content_brief` | Clara |
+| `Vito_TrendStrategist` | riset tren **nyata**, judul, thumbnail | `scan_viral_trends_and_youtube_outliers`, `research_current_trends`, `get_recent_content_memory`, `check_topic_similarity_in_memory`, `save_content_brief` | Clara |
 | `Clara_Scriptwriter` | naskah retensi tinggi, A-Roll/B-Roll | `save_production_script`, `save_scene_breakdown` | Damon |
-| `Damon_RealityChecker` | QC + hak veto (2 gerbang) | `inspect_rendered_output` | Clara / Bima / Raka / Sora |
+| `Damon_RealityChecker` | QC + hak veto (2 gerbang) | `inspect_rendered_output`, `check_topic_similarity_in_memory`, `register_new_episode_to_memory` | Clara / Bima / Raka / Sora |
 | `Bima_StudioPM` | gatekeeper human-in-the-loop | `request_and_check_creator_files`, `send_direct_alert_to_creator` | Raka |
 | `Raka_Producer` | render ffmpeg 1080p60 / Remotion per scene | `assemble_and_render_video`, `assemble_story_from_script` | Damon |
 | `Sora_YouTubePublisher` | SEO + upload YouTube | `upload_to_youtube`, `send_direct_alert_to_creator` | — (menutup rapat) |
@@ -718,12 +718,41 @@ dilarang mengarang angka tren — sama seperti aturan `RISET TIDAK TERSEDIA` di 
 | `runs` | setiap rapat: topik, status, brief, path naskah/video, URL YouTube, error |
 | `videos` | video yang tayang + performa (`views`, `ctr`, catatan) |
 | `topics` | topik yang pernah dibahas |
+| `content_history` | **katalog episode** (memori episodik): topik, judul, keyword, status, `youtube_video_id`, `views_count` |
+
+### Memori episodik (anti-duplikasi antar minggu)
+
+Katalog episode dijaga dua lapis:
+
+1. **FTS5** (`content_history_fts`, tersinkron lewat trigger) untuk pencarian cepat;
+   bila build SQLite tidak punya FTS5, semuanya otomatis jatuh ke pemindaian penuh
+   (`memory.fts == False`) dengan hasil yang sama.
+2. **Skor kemiripan token** — irisan token ÷ himpunan token terkecil, stopword
+   bahasa Indonesia dibuang. Ambang `DUPLICATE_WARNING` = **55 %**.
+
+Alur di ruang rapat:
+
+| Bot | Tool | Kapan |
+|---|---|---|
+| Vito | `get_recent_content_memory` | sebelum menyusun brief (lihat judul + views lama) |
+| Vito & Damon | `check_topic_similarity_in_memory` | menguji calon topik; `DUPLICATE_WARNING` = ganti sudut |
+| Damon | `register_new_episode_to_memory` | tepat setelah `SCRIPT PASS` (status `SCRIPT_APPROVED`) |
+| Sora | *(otomatis)* | setelah upload → status `PUBLISHED` + `youtube_video_id` |
+
+Sinkronisasi views untuk evaluasi Vito (kuota terpakai 1 request per 50 video):
+
+```bash
+curl -s -X POST "http://127.0.0.1:8100/kra/memory/sync-views"        # cron mingguan n100n
+curl -s "http://127.0.0.1:8100/kra/memory/episodes?limit=15"          # audit topik
+```
+
+Daemon juga memanggilnya otomatis di awal rapat ideasi **bila** `YOUTUBE_API_KEY` ada.
 
 Sebelum rapat dimulai, `MemoryStore.prompt_context()` merangkum riwayat dan
 menyuntikkannya ke system prompt **Vito dan Sora saja**:
 
 ```text
-## MEMORI STUDIO (3 rapat terakhir, 2 video tercatat)
+## MEMORI STUDIO (3 rapat, 2 video, 4 episode tercatat)
 - 2026-11-01 | Workflow editing video 2026 | PIPELINE_COMPLETE | judul: 5 Tool Editing ...
 Performa video (pakai ini untuk memilih sudut pandang, bukan mengarang statistik):
 - 5 Tool Editing Video → 2500 views, CTR 7.5% — CTR bagus
@@ -777,7 +806,7 @@ studio/
   thumbnail.py                # thumbnail YouTube 1280x720 via `npx remotion still`
   state.py                    # pipeline_state.json atomik + gate untuk scheduler n100n
   research.py                 # tren nyata: YouTube API, Tavily, SerpAPI + radar outlier & RSS
-  memory.py                   # SQLite: runs, videos, topics, prompt_context()
+  memory.py                   # SQLite: runs, videos, topics, katalog episode + FTS5 + views
   notify.py                   # Telegram: pesan HTML, lampiran multipart, laporan naskah/upload
   daemon.py                   # antrean job, watcher, scheduler, perintah Telegram
   api.py                      # FastAPI: /kra/schedule/1..3, /kra/n100n-trigger, /health, /status
@@ -786,7 +815,7 @@ studio/
 agents/*.md                   # persona 6 bot
 remotion_template/            # Root.tsx + StoryScene.tsx untuk kantor-rama-ai/remotion_studio
 schedules/                    # kra_autonomous_workflow.json (n8n dual-loop, Asia/Jakarta)
-tests/                        # 203 test: unit, daemon, API, story, TTS, B-Roll, thumbnail, radar
+tests/                        # 219 test: unit, daemon, API, story, TTS, B-Roll, thumbnail, radar, memori
 requirements-daemon.txt       # fastapi + uvicorn (mode --serve)
 requirements-media.txt        # openai-whisper (+ catatan ffmpeg/auto-editor/remotion)
 ```
@@ -821,7 +850,7 @@ tetap macet, `max_round` menghentikannya dan laporan berstatus
 
 ```bash
 pip install -r requirements-dev.txt
-pytest            # 203 test
+pytest            # 219 test
 ruff check .
 ```
 
@@ -829,7 +858,7 @@ ruff check .
 - `tests/test_office.py` — struktur 6 bot, kepemilikan tool, graf transisi per fase, terminasi.
 - `tests/test_rehearsal.py` — pipeline deterministik tanpa LLM.
 - `tests/test_media.py` — deteksi kapabilitas, langkah yang gagal **dilaporkan** bukan disembunyikan, SRT/subtitle filter.
-- `tests/test_memory.py` — upsert run, performa video, konteks memori, persistensi antar-proses.
+- `tests/test_memory.py` — upsert run, performa video, konteks memori, persistensi antar-proses, katalog episode (FTS5 + skor kemiripan, sinkronisasi views).
 - `tests/test_daemon.py` — jadwal, watcher (file muncul sekali), antrean job, resume, perintah Telegram, shutdown.
 - `tests/test_api.py` — webhook n100n: 202, 409, 422, sanitasi path; plus dual-loop `/kra/schedule/1..3`.
 - `tests/test_research.py` — parsing YouTube/Tavily, fallback antar-provider, dan perilaku jujur tanpa kredensial.
@@ -884,6 +913,9 @@ dijawab deterministik, tetapi seluruh mesin AutoGen tetap berjalan.
 | `THUMBNAILS_GAGAL` tapi video jadi | Normal: thumbnail tidak pernah membatalkan render. Alasan ada di `notes` |
 | Thumbnail > 2 MB | Turunkan `--quality` atau sederhanakan gambar; laporan menandainya di `oversized` |
 | Thumbnail tidak terpasang di YouTube | Hanya pada upload **live** (`client_secret.json`); cek `thumbnail.status` di receipt |
+| Vito berhenti di `DUPLICATE_WARNING` | Itu benar: topik ≥ 55 % mirip riwayat. Minta sudut baru, atau periksa `/kra/memory/episodes` |
+| `python: no such module: fts5` | Build SQLite tanpa FTS5; modul otomatis memakai pemindaian penuh (`memory.fts = False`), tidak ada fitur yang hilang |
+| `views_count` tetap 0 | `YOUTUBE_API_KEY` kosong atau video masih `UPLOADED_SIMULATION` (tidak punya `youtube_video_id`) |
 | `RISET TIDAK TERSEDIA` dari radar | Tidak ada jaringan/kuota? Isi `YOUTUBE_API_KEY` atau `pip install yt-dlp`; Vito dilarang mengarang tren |
 | `ready_to_produce` selalu false | Cek `pipeline_status`: `SCRIPTING_IN_PROGRESS`/`RENDERING` = sibuk, `PUBLISHED_COMPLETE`/`ERROR` = tunggu jadwal 08:00 berikutnya |
 | Video Creator diproses dua kali | Seharusnya tidak terjadi: file diarsipkan ke `input_creator/processed/`. Hapus `workspace/pipeline_state.json` hanya bila status tertinggal setelah crash |

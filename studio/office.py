@@ -46,6 +46,18 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "Rakit semua scene dari ./workspace/script_production.json: Whisper per scene, render "
         "Remotion (aset disalin ke public/kra_temp), lalu concat. Jalur utama bila naskah JSON ada."
     ),
+    "get_recent_content_memory": (
+        "Lihat katalog episode KRA (topik, judul, status, views) sebelum menentukan ide, "
+        "supaya tidak mengulang cerita minggu-minggu sebelumnya."
+    ),
+    "check_topic_similarity_in_memory": (
+        "Uji calon topik/judul terhadap riwayat episode (ambang 55%). Balasan "
+        "DUPLICATE_WARNING berarti topik wajib diganti sudut pandangnya."
+    ),
+    "register_new_episode_to_memory": (
+        "Catat episode yang sudah lolos SCRIPT PASS (project_id, topik, judul, keyword) ke "
+        "katalog SQLite KRA agar terkunci dari duplikasi."
+    ),
     "scan_viral_trends_and_youtube_outliers": (
         "Radar real-time Vito: Google Trends hari ini, berita 48 jam, dan video YouTube "
         "dengan Outlier Score (views ÷ subscriber). Wajib dipanggil sebelum menulis brief."
@@ -118,6 +130,9 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
             "1. Riset sudut pandang yang belum jenuh untuk topik Creator.\n"
             "2. Tulis brief: 3 judul (<55 karakter), 3 konsep thumbnail, angle, target audiens, "
             "3 keyword.\n"
+            "2b. Sebelum menulis brief: panggil `get_recent_content_memory` dan uji calon topik "
+            "dengan `check_topic_similarity_in_memory`. Bila balasannya `DUPLICATE_WARNING`, "
+            "ambil sudut pandang lain — dilarang melanjutkan topik yang sama.\n"
             "3. Panggil `save_content_brief(...)` (otomatis menjadi content_brief.json) dan sertakan "
             "`thumbnail_badge`, `thumbnail_hooks` (3 variasi ≤ 4 kata), serta "
             "`thumbnail_visual_prompt` (bahasa Inggris, latar saja) untuk mesin thumbnail Raka.\n"
@@ -131,6 +146,8 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
         tools=(
             "research_current_trends",
             "scan_viral_trends_and_youtube_outliers",
+            "get_recent_content_memory",
+            "check_topic_similarity_in_memory",
             "save_content_brief",
         ),
         handoff=("Clara_Scriptwriter",),
@@ -196,13 +213,22 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
             "`inspect_rendered_output('final_render.mp4')`. Hanya bila hasil tool berisi 'AUDIT LULUS' "
             "kamu boleh menulis `VIDEO PASS` dan menyerahkan ke Sora_YouTubePublisher. Bila 'AUDIT GAGAL', "
             "kembalikan ke Raka_Producer dengan bukti tool.\n"
+            "**Gerbang 1b — memori.** Sebelum memberi `SCRIPT PASS`, uji topik naskah dengan "
+            "`check_topic_similarity_in_memory`; bila `DUPLICATE_WARNING`, tolak dan minta Clara "
+            "mengganti sudut pandang. Setelah `SCRIPT PASS`, panggil "
+            "`register_new_episode_to_memory(project_id, topic_summary, primary_title, keywords)` "
+            "supaya episode hari itu terkunci di katalog.\n"
             "Kamu tidak boleh merender, menulis naskah, atau mengunggah apa pun."
         ),
         default_reply=(
             "Saya belum menerima bukti tool yang cukup untuk memberi vonis. Kirim hasil render atau "
             "naskah final beserta path filenya."
         ),
-        tools=("inspect_rendered_output",),
+        tools=(
+            "inspect_rendered_output",
+            "check_topic_similarity_in_memory",
+            "register_new_episode_to_memory",
+        ),
         handoff=("Clara_Scriptwriter", "Bima_StudioPM", "Raka_Producer", "Sora_YouTubePublisher"),
     ),
     AgentSpec(

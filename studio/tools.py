@@ -32,6 +32,7 @@ from typing import Annotated, Any
 
 from .config import Settings, env_flag
 from .media import MediaError, MediaPipeline, detect_capabilities
+from .memory import tokenize
 from .story import StoryBuilder, StoryError, validate_story
 from .thumbnail import primary_thumbnail
 
@@ -47,6 +48,9 @@ SCENE_FILENAME = "script_production.json"
 TOOL_NAMES: tuple[str, ...] = (
     "research_current_trends",
     "scan_viral_trends_and_youtube_outliers",
+    "get_recent_content_memory",
+    "check_topic_similarity_in_memory",
+    "register_new_episode_to_memory",
     "save_content_brief",
     "save_production_script",
     "save_scene_breakdown",
@@ -84,12 +88,23 @@ class StudioTools:
         settings: Settings,
         notifier: Any | None = None,
         radar: Callable[..., Any] | None = None,
+        memory: Any | None = None,
     ) -> None:
         self.settings = settings
         self.paths = settings.paths.ensure()
         self._caps = None
         self._notifier = notifier
         self._radar = radar
+        self._memory = memory
+
+    @property
+    def memory(self):
+        """Katalog episode (memori episodik) — SQLite yang sama dengan riwayat rapat."""
+        if self._memory is None:
+            from .memory import MemoryStore
+
+            self._memory = MemoryStore(self.settings.memory_db_path)
+        return self._memory
 
     @property
     def radar(self):
@@ -152,6 +167,9 @@ class StudioTools:
         for name in (
             "research_current_trends",
             "scan_viral_trends_and_youtube_outliers",
+            "get_recent_content_memory",
+            "check_topic_similarity_in_memory",
+            "register_new_episode_to_memory",
             "save_scene_breakdown",
             "request_and_check_creator_files",
             "assemble_and_render_video",
@@ -302,6 +320,113 @@ class StudioTools:
             f"{RADAR_FILENAME}):\n"
             + json.dumps(payload, ensure_ascii=False, indent=2)
         )
+
+    def get_recent_content_memory(
+        self,
+        limit: Annotated[int, "Jumlah episode terakhir yang ditampilkan (default 15)"] = 15,
+    ) -> str:
+        """Riwayat episode KRA agar Vito tidak mengulang cerita lama."""
+        return self.memory.episodes_text(max(1, min(int(limit or 15), 50)))
+
+    def check_topic_similarity_in_memory(
+        self,
+        candidate_topic_and_title: Annotated[
+            str,
+            "Gabungan calon topik dan judul yang ingin diuji terhadap riwayat episode",
+        ],
+    ) -> str:
+        """Bandingkan calon topik dengan katalog episode (ambang 55%)."""
+        candidate = (candidate_topic_and_title or "").strip()
+        if not tokenize(candidate):
+            return "ERROR MEMORI: calon topik kosong; sebutkan topik + judul yang ingin diuji."
+        matches = self.memory.check_topic_similarity(candidate)
+        self._log("check_topic_memory", candidate=candidate[:120], matches=len(matches))
+        if not matches:
+            return (
+                "TOPIC_UNIQUE_PASS: topik dan judul ini segar dan belum pernah "
+                "diproduksi di KRA."
+            )
+        detail = json.dumps(matches, ensure_ascii=False, indent=2)
+        return (
+            "DUPLICATE_WARNING: calon topik ini terlalu mirip dengan konten KRA sebelumnya.\n"
+            f"Rincian kemiripan:\n{detail}\n"
+            "INSTRUKSI: ganti sudut pandang (angle) atau pilih topik lain dari radar; "
+            "jangan melanjutkan topik ini."
+        )
+
+    def register_new_episode_to_memory(
+        self,
+        project_id: Annotated[str, "ID unik proyek cerita (mis. story_kra_20261107)"],
+        topic_summary: Annotated[str, "Ringkasan topik dan sudut pandang cerita"],
+        primary_title: Annotated[str, "Judul utama yang dipilih"],
+        keywords: Annotated[str, "Kata kunci utama, dipisahkan koma"] = "",
+    ) -> str:
+        """Catat episode yang sudah lolos SCRIPT PASS ke memori episodik."""
+        title = (primary_title or "").strip()
+        if not title:
+            return "ERROR MEMORI: judul utama kosong; episode tidak dicatat."
+        all_titles = self._brief_titles()
+        saved = self.memory.register_episode(
+            project_id,
+            topic_summary=(topic_summary or "").strip() or title,
+            primary_title=title,
+            keywords=keywords,
+            all_titles=all_titles,
+            status="SCRIPT_APPROVED",
+        )
+        self._log("register_episode", project_id=saved, title=title[:120])
+        duplicate = self.memory.check_topic_similarity(f"{topic_summary} {title}")
+        duplicate = [match for match in duplicate if match["project_id"] != saved]
+        note = ""
+        if duplicate:
+            note = (
+                f"\n⚠️ Catatan: masih ada {len(duplicate)} episode lama yang mirip "
+                f"(tertinggi {duplicate[0]['similarity_percent']}). Sampaikan ke Vito di rapat "
+                "berikutnya, bukan disembunyikan."
+            )
+        return (
+            f"MEMORI TERSIMPAN: proyek '{saved}' ({title}) tercatat di katalog episode SQLite KRA."
+            f"{note}"
+        )
+
+    def _brief_titles(self) -> list[str]:
+        brief = self._read_json(self.paths.workspace / "content_brief.json")
+        raw = brief.get("title_options") or brief.get("titles") or []
+        titles: list[str] = []
+        for entry in raw if isinstance(raw, list) else []:
+            title = entry.get("title") if isinstance(entry, dict) else entry
+            if str(title or "").strip():
+                titles.append(str(title).strip())
+        return titles
+
+    def _read_json(self, path: Path) -> dict[str, Any]:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _record_episode_upload(self, *, status: str, video_id: str, url: str, title: str) -> str:
+        """Update katalog episode setelah upload (live atau simulasi)."""
+        try:
+            script = self._read_json(self.paths.workspace / SCENE_FILENAME)
+            project_id = str(script.get("project_id") or "").strip()
+            if not project_id:
+                project_id = f"kra_{int(time.time())}"
+            if self.memory.get_episode(project_id) is None:
+                self.memory.register_episode(
+                    project_id,
+                    topic_summary=str(script.get("title") or title).strip() or title,
+                    primary_title=title,
+                    keywords=script.get("keywords") or "",
+                )
+            self.memory.mark_episode_published(
+                project_id, video_id=video_id, url=url, title=title, status=status
+            )
+            return project_id
+        except Exception as exc:  # noqa: BLE001 - memori tidak boleh menggagalkan upload
+            print(f"⚠️  Gagal memperbarui memori episodik: {type(exc).__name__}: {exc}", flush=True)
+            return ""
 
     def research_current_trends(
         self,
@@ -742,7 +867,11 @@ class StudioTools:
         thumb = primary_thumbnail(self.settings)
         client_secret = self.paths.root / "client_secret.json"
         if not client_secret.exists():
+            project_id = self._record_episode_upload(
+                status="UPLOADED_SIMULATION", video_id="", url="", title=title
+            )
             receipt = {
+                "project_id": project_id,
                 "status": "UPLOADED_SIMULATION",
                 "video_path": self._rel(video),
                 "title": title,
@@ -777,8 +906,13 @@ class StudioTools:
 
         video_id = response.get("id", "")
         thumbnail_status = response.get("_thumbnail_status", "not_attempted")
+        live_url = f"https://youtu.be/{video_id}" if video_id else ""
+        project_id = self._record_episode_upload(
+            status="PUBLISHED", video_id=video_id, url=live_url, title=title
+        )
         receipt = {
             "status": "UPLOADED_LIVE",
+            "project_id": project_id,
             "thumbnail": {
                 "status": thumbnail_status,
                 "file": thumb.name if thumb else "",

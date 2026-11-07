@@ -308,3 +308,79 @@ def test_apply_thumbnail_failure_does_not_raise(settings: Settings) -> None:
 def test_apply_thumbnail_without_file(settings: Settings) -> None:
     studio = StudioTools(settings)
     assert studio._apply_thumbnail(object(), "vid") == "no_thumbnail"
+
+
+# ---------------------------------------------------- memori episodik (tool)
+def _episode_tools(settings: Settings) -> StudioTools:
+    from studio.memory import MemoryStore
+
+    return StudioTools(settings, memory=MemoryStore(settings.memory_db_path))
+
+
+def test_memory_tools_flow(settings: Settings) -> None:
+    studio = _episode_tools(settings)
+    assert "MEMORI KRA KOSONG" in studio.get_recent_content_memory()
+
+    saved = studio.register_new_episode_to_memory(
+        "story_kra_001",
+        "kantor AI berjalan tanpa manusia",
+        "Kantor AI Tanpa Manusia",
+        "ai agent, otomasi",
+    )
+    assert saved.startswith("MEMORI TERSIMPAN")
+    assert "story_kra_001" in studio.get_recent_content_memory()
+
+    check = studio.check_topic_similarity_in_memory("Kantor AI tanpa manusia malam hari")
+    assert check.startswith("DUPLICATE_WARNING")
+    assert "story_kra_001" in check
+    assert "ganti sudut pandang" in check
+
+    fresh = studio.check_topic_similarity_in_memory("Cara merawat tanaman hias")
+    assert fresh.startswith("TOPIC_UNIQUE_PASS")
+
+
+def test_register_rejects_empty_title_and_flags_similar(settings: Settings) -> None:
+    studio = _episode_tools(settings)
+    assert studio.register_new_episode_to_memory("p0", "topik", "  ").startswith("ERROR MEMORI")
+
+    studio.register_new_episode_to_memory("p1", "kantor AI tanpa manusia", "Kantor AI Tanpa Manusia")
+    result = studio.register_new_episode_to_memory(
+        "p2", "kantor AI berjalan tanpa manusia", "Kantor AI Tanpa Operator"
+    )
+    assert "MEMORI TERSIMPAN" in result
+    assert "masih ada" in result  # kemiripan dilaporkan, bukan disembunyikan
+
+
+def test_similarity_tool_rejects_empty(settings: Settings) -> None:
+    studio = _episode_tools(settings)
+    assert studio.check_topic_similarity_in_memory("   ").startswith("ERROR MEMORI")
+
+
+def test_upload_records_episode_in_memory(settings: Settings) -> None:
+    from studio.memory import MemoryStore
+
+    memory = MemoryStore(settings.memory_db_path)
+    studio = StudioTools(settings, memory=memory)
+    (settings.paths.workspace / "script_production.json").write_text(
+        json.dumps({"project_id": "story_kra_777", "title": "Kantor AI Tanpa Manusia"}),
+        encoding="utf-8",
+    )
+    video = settings.paths.output_ready / "final_render.mp4"
+    video.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"v" * 2048)
+
+    studio.upload_to_youtube("final_render.mp4", "Judul", "00:00 intro", ["a", "b", "c"])
+
+    episode = memory.get_episode("story_kra_777")
+    assert episode is not None
+    assert episode["status"] == "UPLOADED_SIMULATION"  # jujur: bukan PUBLISHED
+    receipt = json.loads((settings.paths.output_ready / RECEIPT_FILENAME).read_text(encoding="utf-8"))
+    assert receipt["project_id"] == "story_kra_777"
+
+
+def test_memory_tools_exposed_to_bots() -> None:
+    from studio.office import AGENT_SPECS
+
+    tools = {spec.key: set(spec.tools) for spec in AGENT_SPECS}
+    assert {"get_recent_content_memory", "check_topic_similarity_in_memory"} <= tools["vito"]
+    assert {"check_topic_similarity_in_memory", "register_new_episode_to_memory"} <= tools["damon"]
+    assert "get_recent_content_memory" not in tools["sora"]
