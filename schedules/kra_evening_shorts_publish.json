@@ -1,0 +1,47 @@
+{
+  "name": "KRA — Publikasi YouTube Shorts 17:00 WIB",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            { "field": "cronExpression", "expression": "0 17 * * *" }
+          ]
+        }
+      },
+      "id": "cron-evening-shorts-publish",
+      "name": "Setiap 17:00 WIB — Upload YouTube Shorts",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [200, 900]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://127.0.0.1:8100/kra/schedule/publish-shorts",
+        "options": {}
+      },
+      "id": "http-trigger-publish-shorts",
+      "name": "Panggil API Publish Shorts KRA",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [460, 900]
+    }
+  ],
+  "connections": {
+    "Setiap 17:00 WIB — Upload YouTube Shorts": {
+      "main": [
+        [
+          {
+            "node": "Panggil API Publish Shorts KRA",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": { "executionOrder": "v1" },
+  "active": false,
+  "notes": "Idempoten: file Shorts yang sudah tayang tidak di-upload ulang (kecuali ?force=true). Jawaban: UPLOADED_LIVE | UPLOADED_SIMULATION | SUDAH_TAYANG | TIDAK_ADA_SHORTS | ERROR."
+}

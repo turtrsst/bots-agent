@@ -1,0 +1,47 @@
+{
+  "name": "KRA — Sync Views Mingguan (Vito performance loop)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            { "field": "cronExpression", "expression": "0 0 * * 0" }
+          ]
+        }
+      },
+      "id": "cron-weekly-sync-views",
+      "name": "Setiap Minggu 00:00 WIB — Sync YouTube Views",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [200, 700]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://127.0.0.1:8100/kra/schedule/sync-views",
+        "options": {}
+      },
+      "id": "http-trigger-sync-views",
+      "name": "Panggil API Sync Views KRA",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [460, 700]
+    }
+  ],
+  "connections": {
+    "Setiap Minggu 00:00 WIB — Sync YouTube Views": {
+      "main": [
+        [
+          {
+            "node": "Panggil API Sync Views KRA",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": { "executionOrder": "v1" },
+  "active": false,
+  "notes": "Impor file ini ke n8n, atau salin dua node ini ke kra_autonomous_workflow.json. Endpoint menjawab {status: SYNCED|EMPTY|NO_KEY, videos, updated, views}."
+}
