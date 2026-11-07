@@ -16,6 +16,17 @@ Dua kelompok endpoint:
 * ``GET  /kra/schedule/2-check-gate``        — tiap 30 menit: sudah siap render?
 * ``POST /kra/schedule/3-produce-and-upload``— render Raka + QC Damon + upload Sora
 
+**Cron n100n (di luar dual-loop)**
+
+* ``POST /kra/schedule/sync-views``           — Minggu 00:00: sinkron views YouTube
+
+**Dashboard & Telegram dua arah**
+
+* ``GET  /`` / ``GET /dashboard``             — KRA Control Center (3 panel, auto-refresh)
+* ``GET  /api/state`` • ``/api/logs`` • ``/api/history`` • ``/api/thumbnails``
+* ``POST /api/thumbnail/select?index=2``      — pilih thumbnail A/B
+* ``POST /kra/telegram-webhook``              — /status /riwayat /thumb /approve /help
+
 **Diagnostik**
 
 * ``GET  /health``  • ``GET /status`` • ``GET /jobs/{job_id}``
@@ -28,7 +39,9 @@ from pathlib import Path
 from typing import Any
 
 from .daemon import DEFAULT_SCHEDULE_TOPIC, Daemon
+from .dashboard import register_dashboard
 from .state import BUSY, READY_RENDER, gate
+from .telegram_webhook import register_telegram_webhook
 
 
 def create_app(daemon: Daemon, *, autostart: bool = True) -> Any:
@@ -189,6 +202,33 @@ def create_app(daemon: Daemon, *, autostart: bool = True) -> Any:
         )
         return {"status": report["status"], **report}
 
+    # ------------------------------------------------- cron mingguan n100n
+    @app.post("/kra/schedule/sync-views")
+    async def schedule_sync_views(limit: int = 50) -> dict[str, Any]:
+        """Minggu 00:00 (n100n) — perbarui ``views_count`` sebelum Vito berideasi.
+
+        Sengaja dijalankan inline: satu request YouTube Data API (maks 50 video)
+        selesai < 2 detik, dan hasilnya bisa langsung diperiksa scheduler.
+        """
+        report = daemon.memory.sync_views(
+            daemon.settings.youtube_api_key, limit=max(1, min(limit, 50))
+        )
+        daemon.state.update(daemon.state.status(), views_sync=report)
+        if report.get("status") == "SYNCED":
+            daemon.chat_log.append(
+                "Sora_Publisher",
+                "Vito_TrendStrategist",
+                f"[SYNC VIEWS] {report['updated']} video diperbarui, total {report['views']} views",
+            )
+            message = "Sinkronisasi views YouTube selesai."
+        elif report.get("status") == "EMPTY":
+            message = "Belum ada video live YouTube untuk disinkronkan."
+        elif report.get("status") == "NO_KEY":
+            message = "YOUTUBE_API_KEY belum diset; sinkronisasi views dilewati."
+        else:
+            message = f"Sinkronisasi views gagal: {report.get('status')}"
+        return {**report, "message": message}
+
     # ------------------------------------------------------ endpoint tunggal
     @app.post("/kra/n100n-trigger", status_code=202)
     async def n100n_trigger(payload: N100nTriggerPayload) -> dict[str, Any]:
@@ -211,6 +251,10 @@ def create_app(daemon: Daemon, *, autostart: bool = True) -> Any:
                 detail="phase harus 'IDEATION_SCRIPT' atau 'PRODUCE_AND_UPLOAD'",
             )
         return {"status": "queued", "phase": phase, "job": job.as_dict()}
+
+    # ----------------------------------------------- dashboard + telegram 2 arah
+    register_dashboard(app, daemon)
+    register_telegram_webhook(app, daemon)
 
     return app
 

@@ -63,6 +63,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--host", default="0.0.0.0", help="Host HTTP bridge (default 0.0.0.0).")
     parser.add_argument("--port", type=int, default=8100, help="Port HTTP bridge (default 8100).")
     parser.add_argument("--schedule", help="Override jadwal ideasi, contoh: '07:00,16:00'.")
+    parser.add_argument(
+        "--shorts",
+        nargs="?",
+        const="final_render.mp4",
+        metavar="MASTER",
+        help="Render YouTube Shorts 9:16 dari master (default: final_render.mp4) lalu keluar.",
+    )
+    parser.add_argument(
+        "--set-webhook",
+        metavar="URL",
+        help="Daftarkan URL webhook Telegram (https://…) untuk /status /riwayat /thumb /approve.",
+    )
     return parser.parse_args(argv)
 
 
@@ -148,6 +160,15 @@ def doctor(settings) -> int:
     print(f"  visual B-Roll : {resolve_broll(settings)}" + (" (Pexels siap)" if settings.pexels_api_key else ""))
     thumbs = "aktif" if settings.thumbnails_enabled else "nonaktif"
     print(f"  thumbnail     : {thumbs} (Remotion Still 1280x720)")
+    print(
+        "  shorts 9:16   : "
+        + (
+            f"aktif ({settings.shorts_duration}s, blur background)"
+            if settings.shorts_enabled
+            else "nonaktif (STUDIO_SHORTS=0)"
+        )
+    )
+    print("  dashboard     : http://127.0.0.1:8100/ (Control Center 3 panel)")
     radar = "YouTube Data API" if settings.youtube_api_key else "yt-dlp fallback"
     print(f"  radar tren    : Google Trends RSS + Google News RSS + {radar}")
     print(f"  jadwal ideasi : {settings.schedule or 'nonaktif'}")
@@ -182,6 +203,13 @@ def print_status(settings) -> int:
                 f"  - {episode['created_at'][:10]} | {episode['status']:<18} | "
                 f"{(episode['primary_title'] or '')[:60]}{views}"
             )
+    from studio.thumbnail import selected_thumbnail
+
+    chosen = selected_thumbnail(settings)
+    print(f"\n🖼️  Thumbnail upload: {chosen.name if chosen else 'belum ada (Sora upload tanpa thumbnail)'}")
+    shorts = (daemon.state.read().get("details") or {}).get("shorts") or {}
+    if shorts:
+        print(f"📱 Shorts terakhir : {shorts.get('file', '-')} ({shorts.get('status')})")
     runs = daemon.memory.recent_runs(5)
     if runs:
         print("\n🧠 Rapat terakhir:")
@@ -211,6 +239,29 @@ def main(argv: list[str] | None = None) -> int:
     if args.faceless:
         settings = settings.with_changes(require_creator_aroll=False)
     settings.paths.ensure()
+
+    if args.shorts:
+        from studio.shorts import format_shorts_caption, generate_youtube_short
+
+        report = generate_youtube_short(settings, master=args.shorts)
+        print(format_shorts_caption(report).replace("<b>", "").replace("</b>", ""))
+        if report.command:
+            print("\nperintah:", " ".join(report.command))
+        return 0 if report.ok else 1
+
+    if args.set_webhook:
+        from studio.telegram_webhook import set_webhook
+
+        result = set_webhook(
+            args.set_webhook,
+            token=settings.telegram_token,
+            secret=settings.telegram_webhook_secret,
+        )
+        print(f"🔗 setWebhook: {result['status']} {result.get('description', '')}".strip())
+        if result.get("ok"):
+            print(f"   URL: {result.get('url')}")
+            print("   Perintah: /status /riwayat /thumb 1 /approve /help")
+        return 0 if result.get("ok") else 1
 
     if args.doctor:
         return doctor(settings)
@@ -296,7 +347,9 @@ def run_long_lived(settings, args) -> int:
     if args.serve:
         from studio.api import run_server
 
-        print(f"🌐 Bridge HTTP di http://{args.host}:{args.port}  → POST /kra/n100n-trigger\n")
+        print(f"🌐 Bridge HTTP di http://{args.host}:{args.port}  → POST /kra/n100n-trigger")
+        print(f"🖥️  Dashboard KRA Control Center: http://127.0.0.1:{args.port}/")
+        print("📱 Telegram dua arah: POST /kra/telegram-webhook (daftarkan dengan --set-webhook)\n")
         try:
             run_server(daemon, args.host, args.port)
         except KeyboardInterrupt:

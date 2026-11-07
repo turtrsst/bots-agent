@@ -134,6 +134,12 @@ class Settings:
     broll_provider: str = "auto"
     thumbnails_enabled: bool = True
     image_api_key: str = ""
+    # --- YouTube Shorts otomatis
+    shorts_enabled: bool = True
+    shorts_duration: int = 45
+    # --- dashboard & webhook Telegram
+    telegram_webhook_secret: str = ""
+    chat_log_limit: int = 100
     pexels_api_key: str = ""
 
     # ------------------------------------------------------------------ setup
@@ -200,6 +206,12 @@ class Settings:
             broll_provider=(pick("STUDIO_BROLL_PROVIDER") or "auto").lower(),
             thumbnails_enabled=env_flag("STUDIO_THUMBNAILS", True, source),
             image_api_key=pick("STUDIO_IMAGE_API_KEY", "OPENAI_IMAGE_API_KEY", "OPENAI_API_KEY"),
+            shorts_enabled=env_flag("STUDIO_SHORTS", True, source),
+            shorts_duration=min(58, max(30, _env_int(source, "STUDIO_SHORTS_DURATION", 45))),
+            telegram_webhook_secret=pick(
+                "STUDIO_TELEGRAM_WEBHOOK_SECRET", "TELEGRAM_WEBHOOK_SECRET"
+            ),
+            chat_log_limit=max(10, _env_int(source, "STUDIO_CHAT_LOG_LIMIT", 100)),
             pexels_api_key=pick("STUDIO_PEXELS_API_KEY", "PEXELS_API_KEY"),
         )
 
@@ -260,5 +272,6 @@ class Settings:
         return (
             f"model={self.model} | endpoint={base} | temperature={self.temperature} | "
             f"max_rounds={self.max_rounds} | api_key={self.masked_api_key()} | gate={mode} | "
-            f"riset={','.join(research) or 'off'} | tts={tts} | broll={visual} | root={self.paths.root}"
+            f"riset={','.join(research) or 'off'} | tts={tts} | broll={visual} | "
+            f"shorts={'on' if self.shorts_enabled else 'off'} | root={self.paths.root}"
         )

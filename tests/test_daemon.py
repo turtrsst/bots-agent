@@ -351,3 +351,54 @@ def test_status_includes_pipeline_state(settings: Settings, notifier) -> None:
 
     assert daemon.status()["pipeline_state"]["status"] == "READY_FOR_RENDER"
     assert "Pipeline: READY_FOR_RENDER" in daemon.status_text()
+
+
+# ------------------------------------------------------------------- shorts
+def test_production_renders_short_after_upload(
+    settings: Settings, notifier, fake_ffmpeg, monkeypatch
+) -> None:
+    """Upload selesai → daemon langsung memotong Shorts 9:16 dari final_render.mp4."""
+    completed = summary(completed=True, awaiting_creator=False, youtube_url="https://youtu.be/abc")
+    settings = settings.with_changes(shorts_duration=40)
+    monkeypatch.setenv("PATH", f"{fake_ffmpeg.parent}:{os.environ.get('PATH', '')}")
+
+    def on_run(topic: str, raw_file: str) -> None:
+        (settings.paths.output_ready / "final_render.mp4").write_bytes(b"video" * 512)
+
+    daemon = make_daemon(settings, notifier, lambda *a, **k: FakeOffice(completed, [], on_run))
+    daemon.submit_production(str(_video(settings.paths.input_creator / "a_roll_raw.mp4")))
+    asyncio.run(daemon.drain())
+
+    shorts = (daemon.state.read()["details"] or {}).get("shorts") or {}
+    assert shorts["status"] == "SHORTS_READY"
+    assert shorts["duration_seconds"] == 40
+    assert shorts["resolution"] == "1080x1920"
+    assert (settings.paths.output_ready / "shorts").is_dir()
+    assert any("KRA SHORTS" in message for message in notifier.messages)
+    assert any("[SHORTS]" in entry["message"] for entry in daemon.chat_log.all())
+
+
+def test_shorts_failure_does_not_fail_pipeline(settings: Settings, notifier, monkeypatch) -> None:
+    completed = summary(completed=True, awaiting_creator=False, youtube_url="https://youtu.be/abc")
+
+    def on_run(topic: str, raw_file: str) -> None:
+        (settings.paths.output_ready / "final_render.mp4").write_bytes(b"video")
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("filter ffmpeg rusak")
+
+    monkeypatch.setattr("studio.shorts.generate_youtube_short", boom)
+    daemon = make_daemon(settings, notifier, lambda *a, **k: FakeOffice(completed, [], on_run))
+    daemon.submit_production(str(_video(settings.paths.input_creator / "a_roll_raw.mp4")))
+    asyncio.run(daemon.drain())
+
+    assert daemon.state.status() == "PUBLISHED_COMPLETE"
+    assert "shorts" not in (daemon.state.read()["details"] or {})
+
+
+def test_chat_log_file_is_shared_with_dashboard(settings: Settings, notifier) -> None:
+    daemon = make_daemon(settings, notifier, lambda *a, **k: None)
+    daemon.chat_log.append("Vito_TrendStrategist", "GROUPCHAT", "Halo dari rapat")
+    path = settings.paths.workspace / "chat_logs.json"
+    assert path.is_file()
+    assert json.loads(path.read_text(encoding="utf-8"))[-1]["sender"] == "Vito_TrendStrategist"

@@ -589,6 +589,9 @@ class MemoryStore:
             ).fetchone()["n"]
             videos = conn.execute("SELECT COUNT(*) AS n FROM videos").fetchone()["n"]
             views = conn.execute("SELECT COALESCE(SUM(views), 0) AS n FROM videos").fetchone()["n"]
+            episode_views = conn.execute(
+                "SELECT COALESCE(SUM(views_count), 0) AS n FROM content_history"
+            ).fetchone()["n"]
             episodes = conn.execute("SELECT COUNT(*) AS n FROM content_history").fetchone()["n"]
             published = conn.execute(
                 "SELECT COUNT(*) AS n FROM content_history WHERE status='PUBLISHED'"
@@ -601,5 +604,6 @@ class MemoryStore:
             "episodes": episodes,
             "published_episodes": published,
             "total_views": views,
+            "episode_views": episode_views,
             "db": str(self.path),
         }

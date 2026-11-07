@@ -18,12 +18,14 @@ Perbaikan penting dibanding skrip linear biasa:
 from __future__ import annotations
 
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from autogen import ConversableAgent, GroupChat, GroupChatManager, register_function
 
+from .chatlog import ChatLog, default_chat_log
 from .config import Settings
 from .personas import Persona, compose_system_message, load_persona
 from .report import collect_files, write_run_report, youtube_url_from_receipt
@@ -508,6 +510,7 @@ class Office:
         persona_sources: dict[str, Persona],
         stage: str = "full",
         require_creator_aroll: bool = True,
+        chat_log: ChatLog | None = None,
     ) -> None:
         self.settings = settings
         self.tools = tools
@@ -518,22 +521,65 @@ class Office:
         self.persona_sources = persona_sources
         self.stage = stage
         self.require_creator_aroll = require_creator_aroll
+        self.chat_log = chat_log
 
     # ------------------------------------------------------------------ run
     def run(self, topic: str, *, raw_file: str = "") -> RunSummary:
         started = time.monotonic()
-        self.creator.initiate_chat(
-            self.manager,
-            message=kickoff_message(
-                topic,
-                self.stage,
-                raw_file=raw_file,
-                require_creator_aroll=self.require_creator_aroll,
-            ),
-            clear_history=True,
-        )
+        self._logged_messages = 0
+        watcher: threading.Thread | None = None
+        stop = threading.Event()
+        if self.chat_log is not None:
+            self.chat_log.append("Creator_Kamu", "GROUPCHAT", f"[RAPAT DIMULAI] topik: {topic}")
+            watcher = threading.Thread(
+                target=self._watch_chat,
+                args=(stop,),
+                name="kra-chat-logger",
+                daemon=True,
+            )
+            watcher.start()
+        try:
+            self.creator.initiate_chat(
+                self.manager,
+                message=kickoff_message(
+                    topic,
+                    self.stage,
+                    raw_file=raw_file,
+                    require_creator_aroll=self.require_creator_aroll,
+                ),
+                clear_history=True,
+            )
+        finally:
+            stop.set()
+            if watcher is not None:
+                watcher.join(timeout=5)
+                self._flush_chat(final=True)
         elapsed = time.monotonic() - started
         return self.summarize(topic, elapsed)
+
+    # ------------------------------------------------------- chat log (live)
+    def _watch_chat(self, stop: threading.Event) -> None:
+        """Salin pesan baru GroupChat ke chat_logs.json selama rapat berjalan.
+
+        AutoGen menambah entri ke ``GroupChat.messages`` selagi berjalan; thread
+        ini memantau panjang list (GIL membuat pembacaan ``len`` aman) sehingga
+        dashboard bisa menampilkan percakapan hampir real-time tanpa hook LLM.
+        """
+        while not stop.is_set():
+            self._flush_chat()
+            stop.wait(1.0)
+
+    def _flush_chat(self, *, final: bool = False) -> None:
+        log = self.chat_log
+        if log is None:
+            return
+        messages = list(self.group_chat.messages)
+        # Selama rapat, tahan satu pesan terakhir supaya penerimanya sudah diketahui.
+        boundary = len(messages) if final else max(0, len(messages) - 1)
+        if boundary <= self._logged_messages:
+            return
+        log.log_messages(messages[:boundary], seen=self._logged_messages)
+        self._logged_messages = boundary
 
     def summarize(self, topic: str, elapsed: float) -> RunSummary:
         messages = list(self.group_chat.messages)
@@ -569,6 +615,7 @@ def build_office(
     stage: str = "full",
     memory_context: str = "",
     require_creator_aroll: bool = True,
+    chat_log: ChatLog | None = None,
 ) -> Office:
     """Rakit 6 bot, Creator, dan GroupChat dengan tool yang sudah terpasang.
 
@@ -661,4 +708,5 @@ def build_office(
         persona_sources=persona_sources,
         stage=stage,
         require_creator_aroll=require_creator_aroll,
+        chat_log=chat_log or default_chat_log(settings.paths.workspace),
     )

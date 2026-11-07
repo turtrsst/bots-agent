@@ -26,6 +26,7 @@ from datetime import time as dtime
 from pathlib import Path
 from typing import Any
 
+from .chatlog import ChatLog, default_chat_log
 from .config import Settings
 from .media import Capabilities, detect_capabilities
 from .memory import MemoryStore, new_run_id
@@ -141,12 +142,16 @@ class Daemon:
         office_factory: Callable[..., Any] | None = None,
         clock: Callable[[], datetime] | None = None,
         state: PipelineState | None = None,
+        chat_log: ChatLog | None = None,
     ) -> None:
         self.settings = settings
         settings.paths.ensure()
         self.notifier = notifier or build_notifier(settings)
         self.memory = memory or MemoryStore(settings.memory_db_path)
         self.state = state or PipelineState(settings.paths.pipeline_state)
+        self.chat_log = chat_log or default_chat_log(
+            settings.paths.workspace, limit=settings.chat_log_limit
+        )
         self.office_factory = office_factory or build_office
         self.clock = clock or (lambda: datetime.now().astimezone())
 
@@ -370,6 +375,7 @@ class Daemon:
             stage="ideation",
             memory_context=self.memory.prompt_context(),
             require_creator_aroll=job.require_aroll,
+            chat_log=self.chat_log,
         )
         self.state.update(SCRIPTING, job_id=job.id, topic=job.topic, run_id=job.run_id or None)
         self._sync_memory_views()
@@ -453,7 +459,10 @@ class Daemon:
             "Remotion, lalu concat. Laporan otomatis dikirim setelah QC Damon selesai.",
         )
         office = self.office_factory(
-            self.settings, stage="production", memory_context=self.memory.prompt_context()
+            self.settings,
+            stage="production",
+            memory_context=self.memory.prompt_context(),
+            chat_log=self.chat_log,
         )
         summary = office.run(topic, raw_file=raw_name)
 
@@ -479,6 +488,7 @@ class Daemon:
                 youtube_url=summary.youtube_url,
                 video="output_ready/final_render.mp4",
             )
+            self._render_shorts(job)
             self._archive_processed(job.raw_file)
             notify_youtube_uploaded(self.notifier, self.settings.paths)
             self.notifier.send(
@@ -506,6 +516,34 @@ class Daemon:
                 )
             )
         return summary
+
+    # ---------------------------------------------------------------- shorts
+    def _render_shorts(self, job: Job) -> None:
+        """Buat Shorts 9:16 dari final_render.mp4; gagal ≠ gagal pipeline."""
+        from .shorts import format_shorts_caption, generate_youtube_short
+
+        video = self.settings.paths.output_ready / "final_render.mp4"
+        if not video.is_file() or video.stat().st_size == 0:
+            return
+        try:
+            report = generate_youtube_short(self.settings, duration=self.settings.shorts_duration)
+        except Exception as exc:  # noqa: BLE001 - Shorts opsional
+            print(f"⚠️  Render Shorts gagal: {type(exc).__name__}: {exc}", flush=True)
+            return
+        if report.status in {"DIMATIKAN"}:
+            return
+        self.state.update(
+            self.state.status(),
+            shorts=report.as_dict(),
+            shorts_job=job.id,
+        )
+        self.notifier.send(format_shorts_caption(report))
+        self.chat_log.append(
+            "Raka_Producer",
+            "Sora_Publisher",
+            f"[SHORTS] {report.status} {report.output.name if report.output else '-'} "
+            f"({report.size_mb} MB, {report.duration}s)",
+        )
 
     # -------------------------------------------------------------- watcher
     def _sync_memory_views(self) -> None:

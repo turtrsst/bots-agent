@@ -192,6 +192,21 @@ def test_sync_views_updates_counts(tmp_path: Path) -> None:
     assert "statistics" in calls[0]
 
 
+def test_stats_counts_episode_views(tmp_path: Path) -> None:
+    memory = _memory(tmp_path)
+    memory.register_episode("p1", topic_summary="topik", primary_title="Judul")
+    memory.mark_episode_published("p1", video_id="vid1", url="https://youtu.be/vid1")
+
+    def transport(_method: str, _url: str, _payload=None, **_kwargs):
+        return {"items": [{"id": "vid1", "statistics": {"viewCount": "4200"}}]}
+
+    memory.sync_views("key", transport=transport)
+    stats = memory.stats()
+    assert stats["episodes"] == 1 and stats["published_episodes"] == 1
+    assert stats["episode_views"] == 4200
+    assert stats["total_views"] == 0  # tabel videos tidak dicampur dengan katalog episode
+
+
 def test_sync_views_without_key_or_videos(tmp_path: Path) -> None:
     memory = _memory(tmp_path)
     assert memory.sync_views("")["status"] == "EMPTY"  # belum ada video live

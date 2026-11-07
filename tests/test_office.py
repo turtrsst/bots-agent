@@ -144,3 +144,11 @@ def test_continuation_selector_returns_tool_owner() -> None:
     assert continuation_selector(owner, tool_result) is owner
     assert continuation_selector(owner, normal) == "auto"
     assert continuation_selector(owner, empty) == "auto"
+
+
+def test_build_office_wires_chat_logger(office, settings: Settings) -> None:
+    """Setiap rapat otomatis menulis ke workspace/chat_logs.json untuk dashboard."""
+    from studio.chatlog import ChatLog
+
+    assert isinstance(office.chat_log, ChatLog)
+    assert office.chat_log.path == settings.paths.workspace / "chat_logs.json"

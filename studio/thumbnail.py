@@ -39,6 +39,7 @@ DEFAULT_PROMPT = (
 DEFAULT_BADGE = "TERBONGKAR"
 DEFAULT_HOOKS = ("BEKERJA TANPA MANUSIA", "RAHASIA KANTOR AI", "100% OTOMATIS")
 PRIMARY_NAME = "thumb_1.jpg"
+CHOICE_FILENAME = "thumbnail_choice.json"  # di workspace/: pilihan A/B dari Telegram/dashboard
 
 Runner = Callable[..., Any]
 
@@ -267,12 +268,63 @@ def format_preview_caption(report: ThumbnailReport) -> str:
     )
 
 
-def primary_thumbnail(settings: Settings) -> Path | None:
-    """File thumbnail utama yang dipasang Sora saat upload (bila ada)."""
-    candidate = settings.paths.output_ready / "thumbnails" / PRIMARY_NAME
+def _thumb_path(settings: Settings, name: str) -> Path | None:
+    """Path thumbnail yang valid (ada, JPEG, < 2 MB) atau ``None``."""
+    candidate = settings.paths.output_ready / "thumbnails" / Path(str(name)).name
     if candidate.is_file() and candidate.stat().st_size > 0:
         return candidate
     return None
+
+
+def thumbnail_variants(settings: Settings) -> list[dict[str, Any]]:
+    """Semua ``thumb_<n>.jpg`` di output_ready/thumbnails, urut nomor."""
+    folder = settings.paths.output_ready / "thumbnails"
+    found: list[dict[str, Any]] = []
+    if not folder.is_dir():
+        return found
+    for path in sorted(folder.glob("thumb_*.jpg")):
+        digits = path.stem.split("_")[-1]
+        if not digits.isdigit():
+            continue
+        found.append({"index": int(digits), "file": path.name, "path": path})
+    return found
+
+
+def choose_thumbnail(settings: Settings, index: int, *, via: str = "cli") -> Path | None:
+    """Simpan pilihan variasi A/B ke ``workspace/thumbnail_choice.json``."""
+    target = _thumb_path(settings, f"thumb_{int(index)}.jpg")
+    if target is None:
+        return None
+    choice = {
+        "file": target.name,
+        "chosen_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "via": via,
+    }
+    path = settings.paths.workspace / CHOICE_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(choice, indent=2, ensure_ascii=False), encoding="utf-8")
+    return target
+
+
+def selected_thumbnail(settings: Settings) -> Path | None:
+    """Thumbnail pilihan Creator; jatuh ke ``thumb_1.jpg`` bila belum memilih."""
+    choice_path = settings.paths.workspace / CHOICE_FILENAME
+    if choice_path.is_file():
+        try:
+            choice = json.loads(choice_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            choice = {}
+        name = str(choice.get("file") or "")
+        if name:
+            chosen = _thumb_path(settings, name)
+            if chosen is not None:
+                return chosen
+    return _thumb_path(settings, PRIMARY_NAME)
+
+
+def primary_thumbnail(settings: Settings) -> Path | None:
+    """File thumbnail utama yang dipasang Sora saat upload (bila ada)."""
+    return selected_thumbnail(settings)
 
 
 def _default_run(cmd: list[str], *, cwd: str | None = None, timeout: float = THUMB_TIMEOUT) -> Any:

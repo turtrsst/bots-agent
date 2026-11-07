@@ -70,7 +70,12 @@ python virtual_office_superbots.py --status          # antrean daemon + isi memo
 
 # mode 24/7 (tanpa terminal, tanpa input())
 python virtual_office_superbots.py --daemon          # scheduler + file watcher + notifikasi
-python virtual_office_superbots.py --serve           # bridge HTTP + jadwal dual-loop n100n (port 8100)
+python virtual_office_superbots.py --serve           # bridge HTTP + dashboard + webhook Telegram (port 8100)
+
+# dashboard visual + Telegram dua arah + Shorts
+python virtual_office_superbots.py --serve           # buka http://127.0.0.1:8100/ (§7e)
+python virtual_office_superbots.py --set-webhook https://xxxx.ngrok-free.app/kra/telegram-webhook
+python virtual_office_superbots.py --shorts          # potong Shorts 9:16 dari final_render.mp4
 ```
 
 Keluaran ada di `workspace/`, `input_creator/`, `output_ready/`:
@@ -92,6 +97,9 @@ Keluaran ada di `workspace/`, `input_creator/`, `output_ready/`:
 | `input_creator/auto_broll_*.mp4` | stock video B-Roll otomatis per scene (§7c) |
 | `output_ready/thumbnails/thumb_1..3.jpg` | thumbnail YouTube 1280×720 (§7d) |
 | `workspace/vito_realtime_radar.json` | arsip radar tren real-time Vito (§7d) |
+| `workspace/chat_logs.json` | 100 pesan terakhir GroupChat untuk dashboard (§7e) |
+| `workspace/thumbnail_choice.json` | variasi thumbnail pilihan Creator (`/thumb 2`) (§7e) |
+| `output_ready/shorts/short_<epoch>.mp4` | YouTube Shorts 9:16 hasil auto-cutter (§7e) |
 
 ---
 
@@ -446,6 +454,11 @@ python virtual_office_superbots.py --serve --host 0.0.0.0 --port 8100
 | `GET /health` | hidup + kapabilitas media (`ffmpeg`, `whisper`, `remotion`) |
 | `GET /status` | antrean, job terakhir, isi memori, status pipeline |
 | `GET /jobs/{id}` | detail satu job |
+| `POST /kra/schedule/sync-views` | cron Minggu 00:00: perbarui `views_count` dari YouTube (§7e) |
+| `GET /` • `/dashboard` | **KRA Control Center**, 3 panel real-time (§7e) |
+| `GET /api/state` • `/api/logs` • `/api/history` • `/api/thumbnails` | data JSON untuk dashboard (§7e) |
+| `POST /api/thumbnail/select?index=N` | pilih variasi thumbnail A/B (§7e) |
+| `POST /kra/telegram-webhook` | Telegram dua arah: `/status` `/riwayat` `/thumb` `/approve` (§7e) |
 
 Payload & contoh (sama dengan `kra_raka_engine.py` milik KRA):
 
@@ -709,6 +722,111 @@ dilarang mengarang angka tren — sama seperti aturan `RISET TIDAK TERSEDIA` di 
 
 ---
 
+## 7e. Control Center, Telegram dua arah & Shorts
+
+### Dashboard KRA Control Center (`studio/dashboard.py`)
+
+`--serve` kini juga menyajikan dashboard web: **http://127.0.0.1:8100/**. Tiga panel,
+auto-refresh 3 detik, tanpa dependensi frontend:
+
+| Panel | Isi | Sumber |
+|---|---|---|
+| 🤖 Live Agent Group Chat | percakapan Vito/Clara/Bima/Raka/Damon/Sora (termasuk panggilan tool) | `workspace/chat_logs.json` |
+| 🧠 SQLite Content Memory | episode terakhir: judul, status, views, link YouTube | tabel `content_history` (§8) |
+| ⚙️ Pipeline & Remotion Queue | status pipeline berjalan + `details` JSON + antrean | `workspace/pipeline_state.json` |
+
+Butuh `pip install -r requirements-daemon.txt` (FastAPI + uvicorn). Padanan nama file spec
+Creator: `kra_chat_logger.py` → `studio/chatlog.py`, `kra_dashboard_server.py` →
+`studio/dashboard.py` (route-nya dipasang di `studio/api.py`, satu server port 8100).
+
+Halaman HTML-nya **self-contained**: CSS + JS ditanam, tanpa CDN Tailwind/Alpine. Alasannya
+praktis — mesin n100n sering tanpa internet, dan dashboard yang bergantung CDN akan tampil
+sebagai teks polos saat offline. Palet & komponennya meniru Tailwind (slate + cyan), jadi
+tampilan spec tetap konsisten.
+
+Endpoint JSON (bisa dipakai Grafana/curl/panel lain):
+
+```bash
+curl -s http://127.0.0.1:8100/api/state            # status + runtime + ringkasan memori
+curl -s http://127.0.0.1:8100/api/logs?limit=50    # chat log terakhir
+curl -s http://127.0.0.1:8100/api/history          # katalog episode SQLite
+curl -s http://127.0.0.1:8100/api/thumbnails       # variasi A/B + mana yang terpilih
+curl -s -X POST "http://127.0.0.1:8100/api/thumbnail/select?index=2"
+curl -s http://127.0.0.1:8100/api/thumbnail/2 -o pilihan.jpg
+```
+
+Pencatat percakapan ada di `studio/chatlog.py` (padanan `kra_chat_logger.py`): satu baris
+per pesan (`sender`, `recipient`, `message`, `timestamp`), maksimum 100 pesan terakhir,
+tulis atomik. `Office.run()` menjalankan thread pemantau yang menyalin pesan baru dari
+`GroupChat.messages` **selagi rapat berjalan** (bukan setelah selesai), jadi panel chat
+benar-benar "live" tanpa hook LLM.
+
+### Telegram dua arah (`studio/telegram_webhook.py`)
+
+Daftarkan sekali (butuh URL https publik — ngrok/cloudflared):
+
+```bash
+python virtual_office_superbots.py --set-webhook https://xxxx.ngrok-free.app/kra/telegram-webhook
+# atau manual:
+curl -X POST "https://api.telegram.org/bot<TOKEN>/setWebhook" \
+     -H "Content-Type: application/json" \
+     -d '{"url": "https://xxxx.ngrok-free.app/kra/telegram-webhook", "secret_token": "rahasia"}'
+```
+
+| Perintah | Efek nyata |
+|---|---|
+| `/status` | status pipeline, job aktif, antrean, jumlah episode & views |
+| `/riwayat` | 5 episode terakhir: `project_id`, judul, status, views, link YouTube |
+| `/thumb 1..3` | variasi thumbnail dipilih → disimpan, pratinjau dikirim, dipakai Sora saat upload |
+| `/approve` | naskah disetujui → `READY_FOR_RENDER` memicu render Raka; `WAITING_FOR_CREATOR` menunggu file rekaman |
+| `/help` | daftar perintah |
+
+Keamanan: `TELEGRAM_WEBHOOK_SECRET` diisi → header `X-Telegram-Bot-Api-Secret-Token` wajib
+cocok (403 bila tidak); `TELEGRAM_CHAT_ID` diisi → update dari chat lain diabaikan. Balasan
+dikirim ke chat pengirim, bukan hanya ke chat default.
+
+> `/approve` sengaja **tidak** mengarang status: kalau belum ada naskah (`IDLE`/`SCRIPTING`),
+> bot menjawab terus terang dan pipeline tidak bergerak.
+
+### YouTube Shorts otomatis (`studio/shorts.py`)
+
+Setiap produksi yang selesai (`PUBLISHED_COMPLETE`) langsung memotong **45 detik** awal
+`final_render.mp4` menjadi 1080×1920 vertikal di `output_ready/shorts/`:
+
+```bash
+ffmpeg -i final_render.mp4 -t 45 -filter_complex \
+  "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=30:30[bg];\
+   [0:v]scale=1080:1920:force_original_aspect_ratio=decrease[fg];\
+   [bg][fg]overlay=(W-w)/2:(H-h)/2[v]" \
+  -map "[v]" -map "0:a?" -c:v libx264 -preset medium -crf 19 -pix_fmt yuv420p \
+  -c:a aac -b:a 192k -movflags +faststart shorts/short_<epoch>.mp4
+```
+
+Teknik **blurred background stack**: latar = salinan penuh yang di-blur, video utama
+di-*scale* utuh di tengah — tidak ada bagian frame 16:9 yang terpotong. Statusnya jujur:
+`SHORTS_READY`, `SHORTS_GAGAL` (dengan potongan stderr ffmpeg), `SKIP_TANPA_FFMPEG`,
+`DIMATIKAN`. Durasi dikunci 30–58 detik (`STUDIO_SHORTS_DURATION`), dan kegagalan Shorts
+**tidak** mengubah status pipeline.
+
+```bash
+python virtual_office_superbots.py --shorts                  # dari final_render.mp4
+python virtual_office_superbots.py --shorts master_lain.mp4  # dari master lain
+```
+
+### Sync views mingguan (n100n)
+
+```bash
+curl -s -X POST http://127.0.0.1:8100/kra/schedule/sync-views
+# {"status":"SYNCED","videos":7,"updated":7,"views":48210,...} | NO_KEY | EMPTY
+```
+
+Node n8n siap impor ada di `schedules/kra_weekly_sync_views.json` (cron `0 0 * * 0` = Minggu
+00:00 WIB). Endpoint dijalankan inline (satu request YouTube API, maks 50 video) supaya hasilnya
+langsung bisa diperiksa scheduler; daemon juga menyinkronkan otomatis di awal rapat ideasi bila
+`YOUTUBE_API_KEY` tersedia.
+
+---
+
 ## 8. Memori jangka panjang
 
 `workspace/studio.db` (SQLite, WAL, tanpa dependensi tambahan):
@@ -808,14 +926,18 @@ studio/
   research.py                 # tren nyata: YouTube API, Tavily, SerpAPI + radar outlier & RSS
   memory.py                   # SQLite: runs, videos, topics, katalog episode + FTS5 + views
   notify.py                   # Telegram: pesan HTML, lampiran multipart, laporan naskah/upload
+  chatlog.py                  # chat_logs.json: 100 pesan terakhir GroupChat untuk dashboard
+  dashboard.py                # KRA Control Center: HTML 3 panel + /api/state|logs|history|thumbnails
+  telegram_webhook.py         # Telegram dua arah: /status /riwayat /thumb /approve + setWebhook
+  shorts.py                   # YouTube Shorts 9:16: blur background stack via ffmpeg
   daemon.py                   # antrean job, watcher, scheduler, perintah Telegram
-  api.py                      # FastAPI: /kra/schedule/1..3, /kra/n100n-trigger, /health, /status
+  api.py                      # FastAPI: /kra/schedule/1..3, /kra/n100n-trigger, /health, /status, dashboard
   report.py                   # transkrip & ringkasan run
   rehearsal.py                # pipeline deterministik tanpa LLM
 agents/*.md                   # persona 6 bot
 remotion_template/            # Root.tsx + StoryScene.tsx untuk kantor-rama-ai/remotion_studio
-schedules/                    # kra_autonomous_workflow.json (n8n dual-loop, Asia/Jakarta)
-tests/                        # 219 test: unit, daemon, API, story, TTS, B-Roll, thumbnail, radar, memori
+schedules/                    # kra_autonomous_workflow.json (n8n dual-loop) + kra_weekly_sync_views.json
+tests/                        # 270 test: unit, daemon, API, dashboard, webhook, shorts, story, memori
 requirements-daemon.txt       # fastapi + uvicorn (mode --serve)
 requirements-media.txt        # openai-whisper (+ catatan ffmpeg/auto-editor/remotion)
 ```
@@ -850,7 +972,7 @@ tetap macet, `max_round` menghentikannya dan laporan berstatus
 
 ```bash
 pip install -r requirements-dev.txt
-pytest            # 219 test
+pytest            # 270 test
 ruff check .
 ```
 
@@ -869,6 +991,11 @@ ruff check .
 - `tests/test_broll.py` — empat tier visual dengan transport palsu, cache, sanitasi nama, dan kegagalan jujur.
 - `tests/test_thumbnail.py` — perencanaan varian dari brief, `npx remotion still` palsu, batas 2 MB, pratinjau Telegram.
 - `tests/test_research.py` (radar) — parsing Google Trends/News RSS, Outlier Score, fallback yt-dlp, dan kejujuran tanpa jaringan.
+- `tests/test_chatlog.py` — buffer 100 pesan, tulis atomik, pemulihan JSON rusak, infersi penerima, panggilan tool.
+- `tests/test_office_chatlog.py` — `Office.run()` mencatat rapat berjalan (bukan setelah selesai), tanpa duplikasi antar-rapat, dan tetap tersimpan bila rapat crash.
+- `tests/test_dashboard.py` — halaman 3 panel tanpa CDN, `/api/state|logs|history|thumbnails`, pemilihan thumbnail A/B, dan cron `sync-views` yang jujur tanpa key.
+- `tests/test_telegram_webhook.py` — semua perintah (`/status` `/riwayat` `/thumb` `/approve`), validasi chat & secret token, serta `setWebhook` sukses/gagal.
+- `tests/test_shorts.py` — filter blur-stack 1080×1920, batas durasi 30–58 detik, sanitasi nama, ffmpeg gagal dilaporkan.
 - `tests/test_group_chat_e2e.py` — **GroupChat sungguhan** dengan `OpenAIWrapper.create`
   yang dipalsukan: membuktikan tool dieksekusi oleh bot yang tepat, loop
   Damon-menolak-Clara berjalan, dan rapat berhenti karena `PIPELINE_COMPLETE`, bukan
@@ -914,6 +1041,11 @@ dijawab deterministik, tetapi seluruh mesin AutoGen tetap berjalan.
 | Thumbnail > 2 MB | Turunkan `--quality` atau sederhanakan gambar; laporan menandainya di `oversized` |
 | Thumbnail tidak terpasang di YouTube | Hanya pada upload **live** (`client_secret.json`); cek `thumbnail.status` di receipt |
 | Vito berhenti di `DUPLICATE_WARNING` | Itu benar: topik ≥ 55 % mirip riwayat. Minta sudut baru, atau periksa `/kra/memory/episodes` |
+| Dashboard tampil teks polos / 404 | `--serve` butuh FastAPI: `pip install -r requirements-daemon.txt`; buka `http://127.0.0.1:8100/` |
+| Panel chat kosong padahal rapat jalan | `workspace/chat_logs.json` ditulis `Office.run()`; cek `StudioTools` log di `workspace/studio_log.jsonl` dan pastikan root studio sama |
+| Webhook Telegram balas `403` | `TELEGRAM_WEBHOOK_SECRET` diset tetapi header `secret_token` tidak dikirim saat `setWebhook`; daftarkan ulang lewat `--set-webhook` |
+| `/approve` bilang "belum ada naskah" | Pipeline memang `IDLE`/`SCRIPTING`; jalankan rapat dulu (`/topic …` atau jadwal 08:00) |
+| Shorts `SKIP_TANPA_FFMPEG` | Install ffmpeg, atau set `STUDIO_SHORTS=0` bila tidak ingin Shorts |
 | `python: no such module: fts5` | Build SQLite tanpa FTS5; modul otomatis memakai pemindaian penuh (`memory.fts = False`), tidak ada fitur yang hilang |
 | `views_count` tetap 0 | `YOUTUBE_API_KEY` kosong atau video masih `UPLOADED_SIMULATION` (tidak punya `youtube_video_id`) |
 | `RISET TIDAK TERSEDIA` dari radar | Tidak ada jaringan/kuota? Isi `YOUTUBE_API_KEY` atau `pip install yt-dlp`; Vito dilarang mengarang tren |
