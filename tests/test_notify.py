@@ -214,3 +214,41 @@ def test_notify_reports_failed_delivery(settings: Settings) -> None:
     _write_script(settings)
     assert "GAGAL" in notify_script_ready(notifier, settings.paths)
     assert "GAGAL" in notify_youtube_uploaded(notifier, settings.paths)
+
+
+def test_send_photo_uses_multipart_photo_field(tmp_path: Path) -> None:
+    transport = Recorder()
+    photos = DocRecorder()
+    notifier = TelegramNotifier(
+        "token-uji", "12345", transport=transport, photo_transport=photos
+    )
+    image = tmp_path / "thumb_1.jpg"
+    image.write_bytes(b"\xff\xd8\xff" + b"x" * 100)
+
+    assert notifier.send_photo(image, caption="<b>Preview</b>")
+    url, fields, filename, data = photos.calls[0]
+    assert url.endswith("/sendPhoto")
+    assert filename == "thumb_1.jpg"
+    assert fields["parse_mode"] == "HTML"
+    assert data.startswith(b"\xff\xd8\xff")
+
+
+def test_send_photo_missing_file_is_reported(tmp_path: Path) -> None:
+    photos = DocRecorder()
+    notifier = TelegramNotifier("t", "1", document_transport=photos, photo_transport=photos)
+    assert notifier.send_photo(tmp_path / "tidak-ada.jpg") is False
+    assert photos.calls == []
+
+
+def test_send_photo_helper_ignores_plain_notifiers(tmp_path: Path) -> None:
+    from studio.notify import send_photo
+
+    class Plain:
+        supports_inbound = False
+
+        def send(self, text: str, *, silent: bool = False) -> bool:
+            return True
+
+    image = tmp_path / "x.jpg"
+    image.write_bytes(b"x")
+    assert send_photo(Plain(), image) is False  # type: ignore[arg-type]

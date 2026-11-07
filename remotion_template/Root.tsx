@@ -1,15 +1,17 @@
 import React from 'react';
-import { Composition } from 'remotion';
+import { Composition, Still } from 'remotion';
 import { StoryScene, StorySceneProps, defaultStoryProps } from './StoryScene';
+import { YouTubeThumbnail, defaultThumbnailProps } from './YouTubeThumbnail';
 
 /**
- * Dua composition yang dipakai studio AutoGen (Raka):
+ * Tiga composition yang dipakai studio AutoGen (Raka):
  *
  *  - `StoryScene`       → scene narasi (teks per kata + video sumber)
  *  - `CreatorOverlay`   → scene A-Roll Creator + lower third
+ *  - `YouTubeThumbnail` → Still 1280x720 untuk `npx remotion still`
  *
- * Keduanya memakai `StoryScene`, jadi props dari `script_production.json`
- * (lewat `--props` saat `npx remotion render`) selalu cocok.
+ * Semua composition/scene memakai props dari `script_production.json`
+ * (lewat `--props` saat `render`) atau `thumb_props_*.json` (saat `still`).
  */
 
 const FPS = 30;
@@ -43,6 +45,13 @@ export const RemotionRoot: React.FC = () => {
         height={1080}
         defaultProps={{ ...defaultStoryProps, showLowerThird: true }}
         calculateMetadata={calculateMetadata}
+      />
+      <Still
+        id="YouTubeThumbnail"
+        component={YouTubeThumbnail}
+        width={1280}
+        height={720}
+        defaultProps={defaultThumbnailProps}
       />
     </>
   );

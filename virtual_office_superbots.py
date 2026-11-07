@@ -146,6 +146,10 @@ def doctor(settings) -> int:
     print(f"  mesin TTS     : {resolve_provider(settings)} (permintaan: {settings.tts_provider})")
     print(f"  suara Edge    : {settings.edge_tts_voice} (rate {settings.tts_rate})")
     print(f"  visual B-Roll : {resolve_broll(settings)}" + (" (Pexels siap)" if settings.pexels_api_key else ""))
+    thumbs = "aktif" if settings.thumbnails_enabled else "nonaktif"
+    print(f"  thumbnail     : {thumbs} (Remotion Still 1280x720)")
+    radar = "YouTube Data API" if settings.youtube_api_key else "yt-dlp fallback"
+    print(f"  radar tren    : Google Trends RSS + Google News RSS + {radar}")
     print(f"  jadwal ideasi : {settings.schedule or 'nonaktif'}")
     print(f"  notifikasi    : {'telegram' if settings.telegram_token and settings.telegram_chat_id else 'konsol'}")
     print(f"  client_secret : {'ada' if (settings.paths.root / 'client_secret.json').exists() else 'tidak ada (upload simulasi)'}")

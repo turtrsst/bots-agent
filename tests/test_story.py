@@ -491,3 +491,70 @@ def test_generator_error_does_not_break_render(
     assert result.ok
     assert any("visual otomatis gagal" in note for note in result.scenes[0].notes)
     assert result.visual_tiers == []
+
+
+# ---------------------------------------------------- thumbnail di laporan
+def test_thumbnails_are_embedded_in_result(
+    story_settings: Settings, fake_ffmpeg: Path, fake_npx: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from studio.thumbnail import ThumbnailReport
+
+    monkeypatch.setattr("studio.story.shutil.which", lambda _name: None)
+    caps = Capabilities(ffmpeg=str(fake_ffmpeg), npx=str(fake_npx), remotion_dir=str(story_settings.remotion_dir))
+    _assets(story_settings)
+    thumb = story_settings.paths.output_ready / "thumbnails" / "thumb_1.jpg"
+    thumb.parent.mkdir(parents=True, exist_ok=True)
+    thumb.write_bytes(b"\xff\xd8\xff" + b"x" * 100)
+    enabled = story_settings.with_changes(thumbnails_enabled=True)
+
+    def fake_thumbs(settings, caps, *, script, notifier=None):
+        assert script["title"]
+        return ThumbnailReport(ok=True, primary=thumb, files=[thumb],
+                               variants=[{"hookText": "HOOK", "accentColor": "#FFE600"}],
+                               notes=["flux: latar"])
+
+    result = StoryBuilder(enabled, caps, thumbs=fake_thumbs).build(
+        _write_story(enabled), enabled.paths.output_ready / "final.mp4"
+    )
+
+    assert result.thumbnails["status"] == "THUMBNAILS_READY"
+    assert result.thumbnails["primary_thumbnail"] == "thumb_1.jpg"
+    assert any("thumbnail: flux" in note for note in result.notes)
+    assert result.as_dict()["thumbnails"]["primary_thumbnail"] == "thumb_1.jpg"
+
+
+def test_thumbnail_disabled_by_setting(
+    story_settings: Settings, fake_ffmpeg: Path, fake_npx: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("studio.story.shutil.which", lambda _name: None)
+    caps = Capabilities(ffmpeg=str(fake_ffmpeg), npx=str(fake_npx), remotion_dir=str(story_settings.remotion_dir))
+    calls: list[str] = []
+
+    def fake_thumbs(*_args, **_kwargs):
+        calls.append("dipanggil")
+
+    result = StoryBuilder(story_settings, caps, thumbs=fake_thumbs).build(
+        _write_story(story_settings), story_settings.paths.output_ready / "final.mp4"
+    )
+
+    assert calls == []
+    assert result.thumbnails["status"] == "DIMATIKAN"
+
+
+def test_thumbnail_error_does_not_fail_render(
+    story_settings: Settings, fake_ffmpeg: Path, fake_npx: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("studio.story.shutil.which", lambda _name: None)
+    caps = Capabilities(ffmpeg=str(fake_ffmpeg), npx=str(fake_npx), remotion_dir=str(story_settings.remotion_dir))
+    enabled = story_settings.with_changes(thumbnails_enabled=True)
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("npx masih tidak ada")
+
+    result = StoryBuilder(enabled, caps, thumbs=boom).build(
+        _write_story(enabled), enabled.paths.output_ready / "final.mp4"
+    )
+
+    assert result.ok
+    assert result.thumbnails["status"] == "THUMBNAILS_GAGAL"
+    assert any("thumbnail gagal" in note for note in result.notes)

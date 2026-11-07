@@ -46,6 +46,10 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "Rakit semua scene dari ./workspace/script_production.json: Whisper per scene, render "
         "Remotion (aset disalin ke public/kra_temp), lalu concat. Jalur utama bila naskah JSON ada."
     ),
+    "scan_viral_trends_and_youtube_outliers": (
+        "Radar real-time Vito: Google Trends hari ini, berita 48 jam, dan video YouTube "
+        "dengan Outlier Score (views ÷ subscriber). Wajib dipanggil sebelum menulis brief."
+    ),
     "save_content_brief": (
         "Simpan content brief (3 judul, thumbnail, angle, audiens, keyword) ke "
         "./workspace/content_brief.json. Panggil setelah brief selesai, jangan hanya menulis di chat."
@@ -107,12 +111,16 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
         ),
         protocol=(
             "## ALUR KERJAMU\n"
-            "0. Panggil `research_current_trends` lebih dulu untuk melihat tren nyata hari ini. "
-            "Kalau hasilnya 'RISET TIDAK TERSEDIA', jangan mengarang angka tren.\n"
+            "0. Panggil `scan_viral_trends_and_youtube_outliers(niche_query, geo_region)` lebih dulu "
+            "(Google Trends + berita 48 jam + outlier YouTube); `research_current_trends` boleh "
+            "menyusul sebagai pembanding. Kalau hasilnya 'RISET TIDAK TERSEDIA', jangan mengarang "
+            "angka tren.\n"
             "1. Riset sudut pandang yang belum jenuh untuk topik Creator.\n"
             "2. Tulis brief: 3 judul (<55 karakter), 3 konsep thumbnail, angle, target audiens, "
             "3 keyword.\n"
-            "3. Panggil `save_content_brief(...)` (file otomatis menjadi content_brief.json).\n"
+            "3. Panggil `save_content_brief(...)` (otomatis menjadi content_brief.json) dan sertakan "
+            "`thumbnail_badge`, `thumbnail_hooks` (3 variasi ≤ 4 kata), serta "
+            "`thumbnail_visual_prompt` (bahasa Inggris, latar saja) untuk mesin thumbnail Raka.\n"
             "4. Baru setelah tool mengembalikan TERSIMPAN, serahkan ke Clara_Scriptwriter.\n"
             "Jangan pernah menulis naskah; itu tugas Clara."
         ),
@@ -120,7 +128,11 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
             "Clara_Scriptwriter, brief saya sudah final di ./workspace/content_brief.json. "
             "Silakan tulis naskahnya sekarang."
         ),
-        tools=("research_current_trends", "save_content_brief"),
+        tools=(
+            "research_current_trends",
+            "scan_viral_trends_and_youtube_outliers",
+            "save_content_brief",
+        ),
         handoff=("Clara_Scriptwriter",),
     ),
     AgentSpec(

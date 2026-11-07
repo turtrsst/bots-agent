@@ -132,6 +132,7 @@ class Settings:
     require_creator_aroll: bool = True
     # --- visual otomatis (B-Roll generator)
     broll_provider: str = "auto"
+    thumbnails_enabled: bool = True
     image_api_key: str = ""
     pexels_api_key: str = ""
 
@@ -197,6 +198,7 @@ class Settings:
             tts_rate=pick("STUDIO_TTS_RATE") or "+5%",
             require_creator_aroll=env_flag("STUDIO_REQUIRE_AROLL", True, source),
             broll_provider=(pick("STUDIO_BROLL_PROVIDER") or "auto").lower(),
+            thumbnails_enabled=env_flag("STUDIO_THUMBNAILS", True, source),
             image_api_key=pick("STUDIO_IMAGE_API_KEY", "OPENAI_IMAGE_API_KEY", "OPENAI_API_KEY"),
             pexels_api_key=pick("STUDIO_PEXELS_API_KEY", "PEXELS_API_KEY"),
         )

@@ -247,3 +247,64 @@ def test_alert_tool_exposed_to_bots(settings: Settings) -> None:
         spec.key for spec in AGENT_SPECS if "send_direct_alert_to_creator" in spec.tools
     }
     assert owners == {"bima", "sora"}
+
+
+# ------------------------------------------------------------ thumbnail
+def test_simulation_receipt_reports_thumbnail(settings: Settings) -> None:
+    studio = StudioTools(settings)
+    video = settings.paths.output_ready / "final_render.mp4"
+    video.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"v" * 2048)
+
+    result = studio.upload_to_youtube("final_render.mp4", "Judul uji", "00:00 intro", ["a", "b", "c"])
+
+    assert "SIMULASI" in result
+    receipt = json.loads((settings.paths.output_ready / RECEIPT_FILENAME).read_text(encoding="utf-8"))
+    assert receipt["thumbnail"]["status"] == "not_sent"
+
+
+def test_apply_thumbnail_sets_and_reports(settings: Settings) -> None:
+    studio = StudioTools(settings)
+    thumb = settings.paths.output_ready / "thumbnails" / "thumb_1.jpg"
+    thumb.parent.mkdir(parents=True, exist_ok=True)
+    thumb.write_bytes(b"\xff\xd8\xff" + b"x" * 100)
+
+    calls: list[tuple[str, str]] = []
+
+    class Thumbnails:
+        def set(self, *, videoId: str, media_body):
+            calls.append(("set", videoId))
+
+            class Exec:
+                def execute(self_inner):
+                    calls.append(("execute", videoId))
+                    return {}
+
+            return Exec()
+
+    class YouTube:
+        def thumbnails(self):
+            return Thumbnails()
+
+    status = studio._apply_thumbnail(YouTube(), "vid123", media_factory=lambda path: path)
+
+    assert status == "set"
+    assert calls == [("set", "vid123"), ("execute", "vid123")]
+
+
+def test_apply_thumbnail_failure_does_not_raise(settings: Settings) -> None:
+    studio = StudioTools(settings)
+    thumb = settings.paths.output_ready / "thumbnails" / "thumb_1.jpg"
+    thumb.parent.mkdir(parents=True, exist_ok=True)
+    thumb.write_bytes(b"\xff\xd8\xff")
+
+    class YouTube:
+        def thumbnails(self):
+            raise RuntimeError("scope kurang")
+
+    status = studio._apply_thumbnail(YouTube(), "vid", media_factory=lambda path: path)
+    assert status.startswith("failed:")
+
+
+def test_apply_thumbnail_without_file(settings: Settings) -> None:
+    studio = StudioTools(settings)
+    assert studio._apply_thumbnail(object(), "vid") == "no_thumbnail"

@@ -57,6 +57,9 @@ class NullNotifier:
     def send_document(self, path: Path | str, caption: str = "") -> bool:
         return False
 
+    def send_photo(self, path: Path | str, caption: str = "") -> bool:
+        return False
+
 
 class ConsoleNotifier:
     """Fallback: cetak ke stdout (dipakai saat Telegram belum dikonfigurasi)."""
@@ -74,6 +77,10 @@ class ConsoleNotifier:
 
     def send_document(self, path: Path | str, caption: str = "") -> bool:
         print(f"📎 [LAMPIRAN] {Path(path).name} — kanal konsol tidak mengirim file", flush=True)
+        return False
+
+    def send_photo(self, path: Path | str, caption: str = "") -> bool:
+        print(f"🖼️  [FOTO] {Path(path).name} — kanal konsol tidak mengirim gambar", flush=True)
         return False
 
 
@@ -97,10 +104,12 @@ def _default_transport(url: str, payload: dict[str, Any], timeout: float) -> dic
         return json.loads(response.read().decode("utf-8"))
 
 
-def _default_document_transport(
+def _multipart_post(
     url: str,
     fields: dict[str, str],
+    field_name: str,
     filename: str,
+    mime: str,
     data: bytes,
     timeout: float,
 ) -> dict[str, Any]:
@@ -113,8 +122,8 @@ def _default_document_transport(
             f"{value}\r\n"
         ).encode()
     body += (
-        f'--{boundary}\r\nContent-Disposition: form-data; name="document"; '
-        f'filename="{filename}"\r\nContent-Type: application/octet-stream\r\n\r\n'
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{field_name}"; '
+        f'filename="{filename}"\r\nContent-Type: {mime}\r\n\r\n'
     ).encode()
     body += data
     body += f"\r\n--{boundary}--\r\n".encode()
@@ -125,6 +134,18 @@ def _default_document_transport(
     )
     with urlopen(request, timeout=timeout) as response:  # noqa: S310 - URL milik Telegram
         return json.loads(response.read().decode("utf-8"))
+
+
+def _default_document_transport(
+    url: str, fields: dict[str, str], filename: str, data: bytes, timeout: float
+) -> dict[str, Any]:
+    return _multipart_post(url, fields, "document", filename, "application/octet-stream", data, timeout)
+
+
+def _default_photo_transport(
+    url: str, fields: dict[str, str], filename: str, data: bytes, timeout: float
+) -> dict[str, Any]:
+    return _multipart_post(url, fields, "photo", filename, "image/jpeg", data, timeout)
 
 
 class TelegramNotifier:
@@ -140,6 +161,7 @@ class TelegramNotifier:
         timeout: float = 10.0,
         transport: Callable[[str, dict[str, Any], float], dict[str, Any]] | None = None,
         document_transport: Callable[..., dict[str, Any]] | None = None,
+        photo_transport: Callable[..., dict[str, Any]] | None = None,
         api_base: str = "https://api.telegram.org",
     ) -> None:
         self.token = token
@@ -147,6 +169,7 @@ class TelegramNotifier:
         self.timeout = timeout
         self.transport = transport or _default_transport
         self.document_transport = document_transport or _default_document_transport
+        self.photo_transport = photo_transport or _default_photo_transport
         self.api_base = api_base.rstrip("/")
 
     def _url(self, method: str) -> str:
@@ -211,6 +234,30 @@ class TelegramNotifier:
             return bool(result.get("ok", False))
         except Exception as exc:  # noqa: BLE001
             print(f"⚠️  Gagal kirim lampiran Telegram: {type(exc).__name__}: {exc}", flush=True)
+            return False
+
+    def send_photo(self, path: Path | str, caption: str = "") -> bool:
+        """Kirim gambar (preview thumbnail) sebagai foto, bukan dokumen."""
+        file_path = Path(path)
+        if not file_path.is_file():
+            print(f"⚠️  Foto '{file_path}' tidak ada; tidak dikirim.", flush=True)
+            return False
+        fields = {
+            "chat_id": self.chat_id,
+            "caption": _strip_tags(caption)[:MAX_CAPTION],
+            "parse_mode": "HTML",
+        }
+        try:
+            result = self.photo_transport(
+                self._url("sendPhoto"),
+                fields,
+                file_path.name,
+                file_path.read_bytes(),
+                self.timeout * 3,
+            )
+            return bool(result.get("ok", False))
+        except Exception as exc:  # noqa: BLE001
+            print(f"⚠️  Gagal kirim foto Telegram: {type(exc).__name__}: {exc}", flush=True)
             return False
 
     def poll(self, offset: int = 0) -> tuple[list[dict[str, Any]], int]:
@@ -279,6 +326,14 @@ def send_html(notifier: Notifier, text: str, *, silent: bool = False) -> bool:
 def send_document(notifier: Notifier, path: Path | str, caption: str = "") -> bool:
     """Kirim lampiran bila kanal mendukung (Telegram); kanal lain melaporkan `False`."""
     sender = getattr(notifier, "send_document", None)
+    if callable(sender):
+        return bool(sender(Path(path), caption))
+    return False
+
+
+def send_photo(notifier: Notifier, path: Path | str, caption: str = "") -> bool:
+    """Kirim foto bila kanal mendukung (Telegram)."""
+    sender = getattr(notifier, "send_photo", None)
     if callable(sender):
         return bool(sender(Path(path), caption))
     return False

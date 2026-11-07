@@ -31,6 +31,7 @@ def settings(studio_root: Path) -> Settings:
         mock_creator=True,
         real_render=False,
         broll_provider="off",  # test tidak boleh memanggil API gambar sungguhan
+        thumbnails_enabled=False,  # thumbnail diuji terpisah dengan npx palsu
     )
 
 

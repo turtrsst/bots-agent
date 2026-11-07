@@ -90,6 +90,8 @@ Keluaran ada di `workspace/`, `input_creator/`, `output_ready/`:
 | `workspace/pipeline_state.json` | status pipeline untuk gate `n100n` (§7b) |
 | `input_creator/auto_bg_*.jpg` | gambar latar AI otomatis per scene (§7c) |
 | `input_creator/auto_broll_*.mp4` | stock video B-Roll otomatis per scene (§7c) |
+| `output_ready/thumbnails/thumb_1..3.jpg` | thumbnail YouTube 1280×720 (§7d) |
+| `workspace/vito_realtime_radar.json` | arsip radar tren real-time Vito (§7d) |
 
 ---
 
@@ -101,7 +103,7 @@ Setiap bot memegang **hanya** tool sesuai perannya. Tool yang sama tidak dibagi 
 | Bot | Peran | Tool | Menyerahkan ke |
 |---|---|---|---|
 | `Creator_Kamu` | Anda (manusia) | — | Vito |
-| `Vito_TrendStrategist` | riset tren **nyata**, judul, thumbnail | `research_current_trends`, `save_content_brief` | Clara |
+| `Vito_TrendStrategist` | riset tren **nyata**, judul, thumbnail | `scan_viral_trends_and_youtube_outliers`, `research_current_trends`, `save_content_brief` | Clara |
 | `Clara_Scriptwriter` | naskah retensi tinggi, A-Roll/B-Roll | `save_production_script`, `save_scene_breakdown` | Damon |
 | `Damon_RealityChecker` | QC + hak veto (2 gerbang) | `inspect_rendered_output` | Clara / Bima / Raka / Sora |
 | `Bima_StudioPM` | gatekeeper human-in-the-loop | `request_and_check_creator_files`, `send_direct_alert_to_creator` | Raka |
@@ -191,6 +193,8 @@ Semua lewat environment (atau `.env`, dimuat otomatis):
 | `STUDIO_BROLL_PROVIDER` | `auto` | `auto`/`dalle`/`flux`/`pexels`/`gradient`/`off` |
 | `STUDIO_IMAGE_API_KEY` | — | Kunci gambar OpenAI (fallback: `OPENAI_API_KEY`); kosong = Flux gratis |
 | `PEXELS_API_KEY` | — | Stock video gratis dari pexels.com/api |
+| `STUDIO_THUMBNAILS` | `1` | `0` = lewati thumbnail YouTube |
+| `YOUTUBE_API_KEY` | — | Alias `STUDIO_YOUTUBE_API_KEY`, dipakai radar outlier Vito |
 | **Riset tren (Vito)** | | |
 | `STUDIO_YOUTUBE_API_KEY` | — | YouTube Data API v3 (API key saja, tanpa OAuth) |
 | `TAVILY_API_KEY` | — | Fallback tren web |
@@ -648,6 +652,63 @@ Clara (§2).
 
 ---
 
+## 7d. Thumbnail YouTube & radar tren real-time
+
+### Thumbnail 1280×720 (`studio/thumbnail.py`)
+
+Raka membuat thumbnail **setelah** concat, dari data Vito — bukan dari naskah:
+
+```json
+{
+  "thumbnail_badge": "FAKTA BARU",
+  "thumbnail_hooks": ["ROBOT BEKERJA MALAM", "NOL MANUSIA", "100% OTOMATIS"],
+  "thumbnail_visual_prompt": "dark automated factory, robotic arms, blue laser light"
+}
+```
+
+Alur:
+
+1. latar AI lewat `studio/broll.py` (DALL·E → Flux → kanvas FFmpeg) → `auto_bg_thumb_base.jpg`;
+2. latar disalin ke `remotion_studio/public/kra_temp/`, lalu
+   `npx --yes remotion still YouTubeThumbnail out.jpg --props=... --image-format=jpeg --quality=90`;
+3. tiga variasi warna (`#FFE600`, `#00F5D4`, `#FF2A54`) ditulis ke
+   `workspace/thumb_props_1..3.json` dan `output_ready/thumbnails/thumb_1..3.jpg`;
+4. pratinjau `thumb_1.jpg` dikirim ke Telegram (foto, bukan dokumen);
+5. file > 2 MB ditandai di laporan (`oversized`) — batas keras YouTube.
+
+Komponennya ada di [`remotion_template/YouTubeThumbnail.tsx`](remotion_template/YouTubeThumbnail.tsx)
+dan didaftarkan sebagai `<Still id="YouTubeThumbnail" width={1280} height={720}>`.
+Ciri yang lolos QC Damon: gradient gelap 95% di sisi teks, hook ≥ 96 px, badge aksen, bingkai tipis.
+
+Saat Sora upload **live**, thumbnail dipasang otomatis
+(`youtube.thumbnails().set(videoId=..., media_body=MediaFileUpload("output_ready/thumbnails/thumb_1.jpg"))`);
+receipt mencatat `thumbnail.status` = `set` / `failed: ...` / `no_thumbnail`. Kegagalan
+thumbnail **tidak** membatalkan upload.
+
+Matikan dengan `STUDIO_THUMBNAILS=0`; laporan render lalu menulis
+`thumbnails.status = "DIMATIKAN"`.
+
+### Radar tren real-time (`studio/research.py`)
+
+Tool Vito `scan_viral_trends_and_youtube_outliers(niche_query, geo_region="ID")` memanggil
+`scan_radar()` yang menggabungkan tiga sumber:
+
+| Sumber | Cara | Kunci |
+|---|---|---|
+| Google Trends RSS | `trends.google.com/trending/rss?geo=ID` | tidak perlu |
+| Google News RSS | `news.google.com/rss/search?q=<niche> when:2d` | tidak perlu |
+| YouTube outlier | `search.list` → `videos.list` → `channels.list`, lalu **Outlier Score = views ÷ subscriber** | `YOUTUBE_API_KEY` |
+| Fallback YouTube | `yt-dlp ytsearchN:<niche> --dump-json` | tidak perlu (tanpa kuota) |
+
+Contoh keluaran yang dipakai Vito: *"outlier 4.8x — channel 10 ribu subs, video 48 ribu
+views dalam 5 hari"*. Hasil mentah disimpan di `workspace/vito_realtime_radar.json`
+dan Vito **wajib** memakainya sebelum menulis brief (`why_viral_now`).
+
+Kalau semua sumber gagal, tool membalas `RISET TIDAK TERSEDIA: ...` dan persona Vito
+dilarang mengarang angka tren — sama seperti aturan `RISET TIDAK TERSEDIA` di §7.
+
+---
+
 ## 8. Memori jangka panjang
 
 `workspace/studio.db` (SQLite, WAL, tanpa dependensi tambahan):
@@ -713,8 +774,9 @@ studio/
   story.py                    # jembatan JSON: naskah Clara → Whisper → Remotion → concat
   tts.py                      # voiceover faceless: ElevenLabs → Edge-TTS → loudnorm -14 LUFS
   broll.py                    # visual otomatis: DALL·E → Flux → Pexels → kanvas FFmpeg
+  thumbnail.py                # thumbnail YouTube 1280x720 via `npx remotion still`
   state.py                    # pipeline_state.json atomik + gate untuk scheduler n100n
-  research.py                 # tren nyata: YouTube Data API, Tavily, SerpAPI
+  research.py                 # tren nyata: YouTube API, Tavily, SerpAPI + radar outlier & RSS
   memory.py                   # SQLite: runs, videos, topics, prompt_context()
   notify.py                   # Telegram: pesan HTML, lampiran multipart, laporan naskah/upload
   daemon.py                   # antrean job, watcher, scheduler, perintah Telegram
@@ -724,7 +786,7 @@ studio/
 agents/*.md                   # persona 6 bot
 remotion_template/            # Root.tsx + StoryScene.tsx untuk kantor-rama-ai/remotion_studio
 schedules/                    # kra_autonomous_workflow.json (n8n dual-loop, Asia/Jakarta)
-tests/                        # 174 test: unit, daemon, API, story, TTS, state, notifikasi, B-Roll
+tests/                        # 203 test: unit, daemon, API, story, TTS, B-Roll, thumbnail, radar
 requirements-daemon.txt       # fastapi + uvicorn (mode --serve)
 requirements-media.txt        # openai-whisper (+ catatan ffmpeg/auto-editor/remotion)
 ```
@@ -759,7 +821,7 @@ tetap macet, `max_round` menghentikannya dan laporan berstatus
 
 ```bash
 pip install -r requirements-dev.txt
-pytest            # 174 test
+pytest            # 203 test
 ruff check .
 ```
 
@@ -776,6 +838,8 @@ ruff check .
 - `tests/test_state.py` — transisi status atomik dan matriks `gate()` (file, 0 byte, busy, faceless).
 - `tests/test_notify.py` — pesan HTML Telegram, lampiran multipart, laporan naskah/upload, dan penandaan "SIMULASI".
 - `tests/test_broll.py` — empat tier visual dengan transport palsu, cache, sanitasi nama, dan kegagalan jujur.
+- `tests/test_thumbnail.py` — perencanaan varian dari brief, `npx remotion still` palsu, batas 2 MB, pratinjau Telegram.
+- `tests/test_research.py` (radar) — parsing Google Trends/News RSS, Outlier Score, fallback yt-dlp, dan kejujuran tanpa jaringan.
 - `tests/test_group_chat_e2e.py` — **GroupChat sungguhan** dengan `OpenAIWrapper.create`
   yang dipalsukan: membuktikan tool dieksekusi oleh bot yang tepat, loop
   Damon-menolak-Clara berjalan, dan rapat berhenti karena `PIPELINE_COMPLETE`, bukan
@@ -816,6 +880,11 @@ dijawab deterministik, tetapi seluruh mesin AutoGen tetap berjalan.
 | `dalle: GAGAL` / `flux: GAGAL` | Cek jaringan/kuota. Render tetap jalan dengan tier berikutnya; cek `scenes[].notes` di `.render.json` |
 | Gambar B-Roll tidak muncul | `STUDIO_BROLL_PROVIDER=off`? `visual_cue` kosong? Scene sudah punya `broll_asset` manual? |
 | `visual_mode` ditolak | Hanya `AI_IMAGE` atau `STOCK_VIDEO`; perbaiki naskah lalu simpan ulang |
+| Thumbnail tidak dibuat | `STUDIO_THUMBNAILS=0`? `STUDIO_REMOTION_DIR` kosong? Composition `YouTubeThumbnail` belum terdaftar di `Root.tsx`? Cek `thumbnails.notes` di `.render.json` |
+| `THUMBNAILS_GAGAL` tapi video jadi | Normal: thumbnail tidak pernah membatalkan render. Alasan ada di `notes` |
+| Thumbnail > 2 MB | Turunkan `--quality` atau sederhanakan gambar; laporan menandainya di `oversized` |
+| Thumbnail tidak terpasang di YouTube | Hanya pada upload **live** (`client_secret.json`); cek `thumbnail.status` di receipt |
+| `RISET TIDAK TERSEDIA` dari radar | Tidak ada jaringan/kuota? Isi `YOUTUBE_API_KEY` atau `pip install yt-dlp`; Vito dilarang mengarang tren |
 | `ready_to_produce` selalu false | Cek `pipeline_status`: `SCRIPTING_IN_PROGRESS`/`RENDERING` = sibuk, `PUBLISHED_COMPLETE`/`ERROR` = tunggu jadwal 08:00 berikutnya |
 | Video Creator diproses dua kali | Seharusnya tidak terjadi: file diarsipkan ke `input_creator/processed/`. Hapus `workspace/pipeline_state.json` hanya bila status tertinggal setelah crash |
 

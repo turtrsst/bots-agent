@@ -33,10 +33,12 @@ from typing import Annotated, Any
 from .config import Settings, env_flag
 from .media import MediaError, MediaPipeline, detect_capabilities
 from .story import StoryBuilder, StoryError, validate_story
+from .thumbnail import primary_thumbnail
 
 SIMULATION_MARKER = b"STUDIO_SIMULATED_MP4"
 TODO_FILENAME = "creator_todo_list.md"
 RECEIPT_FILENAME = "youtube_publish_receipt.json"
+RADAR_FILENAME = "vito_realtime_radar.json"
 SCENE_FILENAME = "script_production.json"
 
 # Nama tool harus UNIK per bot. AutoGen merutekan pesan `tool_calls` ke agen yang
@@ -44,6 +46,7 @@ SCENE_FILENAME = "script_production.json"
 # yang sama, eksekusi bisa mendarat di bot yang salah.
 TOOL_NAMES: tuple[str, ...] = (
     "research_current_trends",
+    "scan_viral_trends_and_youtube_outliers",
     "save_content_brief",
     "save_production_script",
     "save_scene_breakdown",
@@ -76,11 +79,26 @@ def _fmt_bytes(size: int) -> str:
 class StudioTools:
     """Kumpulan tool; satu instance dipakai bersama semua bot dalam satu run."""
 
-    def __init__(self, settings: Settings, notifier: Any | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        notifier: Any | None = None,
+        radar: Callable[..., Any] | None = None,
+    ) -> None:
         self.settings = settings
         self.paths = settings.paths.ensure()
         self._caps = None
         self._notifier = notifier
+        self._radar = radar
+
+    @property
+    def radar(self):
+        """Radar tren real-time (bisa di-inject saat test agar tanpa jaringan)."""
+        if self._radar is None:
+            from .research import scan_radar
+
+            self._radar = scan_radar
+        return self._radar
 
     @property
     def notifier(self):
@@ -110,7 +128,9 @@ class StudioTools:
         def save_content_brief(
             content: Annotated[
                 str,
-                "Isi lengkap content_brief.json (JSON valid: titles, thumbnails, angle, audience, keywords, promise)",
+                "Isi lengkap content_brief.json (JSON valid: titles/title_options, thumbnails, "
+                "thumbnail_badge, thumbnail_hooks, thumbnail_visual_prompt, angle, audience, "
+                "keywords, promise)",
             ],
         ) -> str:
             """Simpan brief riset ke ./workspace/content_brief.json."""
@@ -131,6 +151,7 @@ class StudioTools:
         }
         for name in (
             "research_current_trends",
+            "scan_viral_trends_and_youtube_outliers",
             "save_scene_breakdown",
             "request_and_check_creator_files",
             "assemble_and_render_video",
@@ -242,6 +263,46 @@ class StudioTools:
         )
 
     # -------------------------------------------- 1b. riset tren nyata (Vito)
+    def scan_viral_trends_and_youtube_outliers(
+        self,
+        niche_query: Annotated[
+            str,
+            "Topik/niche yang ingin dipindai, mis. 'AI agent', 'misteri teknologi'",
+        ],
+        geo_region: Annotated[
+            str,
+            "Kode negara Google Trends: 'ID' untuk Indonesia, 'US' untuk global",
+        ] = "ID",
+    ) -> str:
+        """Radar real-time: Google Trends + berita 48 jam + outlier YouTube."""
+        niche = (niche_query or "").strip()
+        if not niche:
+            return "ERROR RADAR: niche_query kosong; sebutkan topik yang ingin dipindai."
+        print(f"📡 [VITO RADAR] Memindai Google Trends ({geo_region}) & outlier YouTube: '{niche}'...", flush=True)
+        radar = self.radar(self.settings, niche, geo=geo_region)
+        payload = radar.as_dict()
+        radar_path = self.paths.workspace / RADAR_FILENAME
+        radar_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        self._log(
+            "scan_radar",
+            niche=niche,
+            real=radar.real,
+            trends=len(radar.trends),
+            news=len(radar.news),
+            outliers=len(radar.outliers),
+        )
+        if not radar.real:
+            return (
+                "RISET TIDAK TERSEDIA: radar real-time gagal "
+                f"({'; '.join(radar.attempts) or 'tanpa percobaan'}). "
+                "Jangan mengarang tren; minta Creator memberi arah topik."
+            )
+        return (
+            "DATA RISET REAL-TIME DITEMUKAN (arsip: workspace/"
+            f"{RADAR_FILENAME}):\n"
+            + json.dumps(payload, ensure_ascii=False, indent=2)
+        )
+
     def research_current_trends(
         self,
         topic: Annotated[
@@ -534,7 +595,7 @@ class StudioTools:
                 f"engine : {caps.summary()}",
             ],
         )
-        builder = StoryBuilder(self.settings, caps)
+        builder = StoryBuilder(self.settings, caps, notifier=self.notifier)
         try:
             result = builder.build(
                 script_path,
@@ -678,6 +739,7 @@ class StudioTools:
         if len(tag_list) < 3:
             warnings.append("tag kurang dari 3")
 
+        thumb = primary_thumbnail(self.settings)
         client_secret = self.paths.root / "client_secret.json"
         if not client_secret.exists():
             receipt = {
@@ -689,6 +751,11 @@ class StudioTools:
                 "chapters_detected": len(timestamps),
                 "warnings": warnings,
                 "video_url": "",
+                "thumbnail": {
+                    "status": "not_sent",
+                    "file": thumb.name if thumb else "",
+                    "note": "thumbnail hanya dipasang pada upload live",
+                },
                 "studio_url": "https://studio.youtube.com/",
                 "next_step": "Taruh client_secret.json (OAuth Desktop App) di root proyek untuk upload live.",
                 "created_at": _now(),
@@ -709,8 +776,13 @@ class StudioTools:
             )
 
         video_id = response.get("id", "")
+        thumbnail_status = response.get("_thumbnail_status", "not_attempted")
         receipt = {
             "status": "UPLOADED_LIVE",
+            "thumbnail": {
+                "status": thumbnail_status,
+                "file": thumb.name if thumb else "",
+            },
             "video_id": video_id,
             "url": f"https://youtu.be/{video_id}",
             "video_url": f"https://youtu.be/{video_id}",
@@ -791,7 +863,31 @@ class StudioTools:
         }
         media = MediaFileUpload(str(video), chunksize=8 * 1024 * 1024, resumable=True)
         request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
-        return request.execute()
+        response = request.execute()
+        response["_thumbnail_status"] = self._apply_thumbnail(youtube, str(response.get("id") or ""))
+        return response
+
+    def _apply_thumbnail(
+        self, youtube: Any, video_id: str, *, media_factory: Callable[[str], Any] | None = None
+    ) -> str:
+        """Pasang `output_ready/thumbnails/thumb_1.jpg` ke video; gagal ≠ upload gagal."""
+        thumb = primary_thumbnail(self.settings)
+        if not video_id or thumb is None:
+            return "no_thumbnail"
+        try:
+            if media_factory is None:
+                from googleapiclient.http import MediaFileUpload
+
+                media = MediaFileUpload(str(thumb), mimetype="image/jpeg", resumable=False)
+            else:
+                media = media_factory(str(thumb))
+            youtube.thumbnails().set(videoId=video_id, media_body=media).execute()
+        except Exception as exc:  # noqa: BLE001 - thumbnail opsional
+            self._log("youtube_thumbnail", status="error", error=f"{type(exc).__name__}: {exc}")
+            print(f"⚠️  Gagal memasang thumbnail: {type(exc).__name__}: {exc}", flush=True)
+            return f"failed: {type(exc).__name__}"
+        self._log("youtube_thumbnail", status="ok", video_id=video_id, file=thumb.name)
+        return "set"
 
     # --------------------------------------------------------------- helper
     @staticmethod

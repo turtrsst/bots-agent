@@ -38,6 +38,7 @@ from .media import (
     segments_to_srt,
     subtitle_filter,
 )
+from .thumbnail import ThumbnailReport, generate_thumbnails
 from .tts import Narration, TTSError, synthesize
 
 SCENE_TYPES = ("REMOTION_DYNAMIC", "CREATOR_AROLL")
@@ -50,6 +51,7 @@ _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 
 TTSFn = Any  # Callable[[Settings, str, Path, ...], Narration]
 BrollFn = Any  # Callable[[Settings, str, str, ...], VisualAsset]
+ThumbFn = Any  # Callable[[Settings, Capabilities, ...], ThumbnailReport]
 VISUAL_MODES = ("AI_IMAGE", "STOCK_VIDEO")
 
 
@@ -276,6 +278,7 @@ class StoryResult:
     workdir: str = ""
     tts_providers: list[str] = field(default_factory=list)
     visual_tiers: list[str] = field(default_factory=list)
+    thumbnails: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -283,6 +286,7 @@ class StoryResult:
             "engine": self.engine,
             "tts_providers": self.tts_providers,
             "visual_tiers": self.visual_tiers,
+            "thumbnails": self.thumbnails,
             "project_id": self.project_id,
             "title": self.title,
             "fps": self.fps,
@@ -310,6 +314,8 @@ class StoryBuilder:
         pipeline: MediaPipeline | None = None,
         tts: TTSFn | None = None,
         broll: BrollFn | None = None,
+        thumbs: ThumbFn | None = None,
+        notifier: Any | None = None,
     ) -> None:
         self.settings = settings
         self.caps = caps or detect_capabilities(settings)
@@ -318,6 +324,8 @@ class StoryBuilder:
         self.workdir.mkdir(parents=True, exist_ok=True)
         self.tts = tts or synthesize
         self.broll = broll or ensure_visual
+        self.thumbs = thumbs or generate_thumbnails
+        self.notifier = notifier
         self._words_cache: dict[str, tuple[list[dict[str, Any]], float]] = {}
 
     # -------------------------------------------------------------- lokasi
@@ -416,6 +424,26 @@ class StoryBuilder:
             )
         except Exception as exc:  # noqa: BLE001 - visual gagal tidak boleh menghentikan render
             return VisualAsset(notes=[f"visual otomatis gagal: {type(exc).__name__}: {str(exc)[:160]}"])
+
+    def _make_thumbnails(self, script: Any, result: StoryResult) -> dict[str, Any]:
+        """Render thumbnail YouTube setelah concat; gagal ≈ catatan, bukan error."""
+        if not self.settings.thumbnails_enabled:
+            return {"status": "DIMATIKAN", "notes": ["STUDIO_THUMBNAILS=0"]}
+        try:
+            report = self.thumbs(
+                self.settings,
+                self.caps,
+                script={"title": script.title, "project_id": script.project_id},
+                notifier=self.notifier,
+            )
+        except Exception as exc:  # noqa: BLE001 - thumbnail tidak boleh menggagalkan video
+            note = f"thumbnail gagal: {type(exc).__name__}: {str(exc)[:160]}"
+            result.notes.append(note)
+            return {"status": "THUMBNAILS_GAGAL", "notes": [note]}
+        payload = report.as_dict() if isinstance(report, ThumbnailReport) else dict(report or {})
+        for note in payload.get("notes") or []:
+            result.notes.append(f"thumbnail: {note}")
+        return payload
 
     @staticmethod
     def _props(
@@ -735,6 +763,7 @@ class StoryBuilder:
             raise StoryError("concat selesai tanpa menghasilkan file")
 
         result.specs = self.pipeline.probe(output_path)
+        result.thumbnails = self._make_thumbnails(script, result)
         engines = {scene.engine for scene in result.scenes if scene.output}
         if engines == {"remotion"}:
             result.engine = "remotion"
