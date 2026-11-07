@@ -88,6 +88,8 @@ Keluaran ada di `workspace/`, `input_creator/`, `output_ready/`:
 | `output_ready/final_render.render.json` | *side-car* bukti render (engine, hash, probe) |
 | `output_ready/youtube_publish_receipt.json` | receipt upload (live atau simulasi) |
 | `workspace/pipeline_state.json` | status pipeline untuk gate `n100n` (§7b) |
+| `input_creator/auto_bg_*.jpg` | gambar latar AI otomatis per scene (§7c) |
+| `input_creator/auto_broll_*.mp4` | stock video B-Roll otomatis per scene (§7c) |
 
 ---
 
@@ -102,9 +104,9 @@ Setiap bot memegang **hanya** tool sesuai perannya. Tool yang sama tidak dibagi 
 | `Vito_TrendStrategist` | riset tren **nyata**, judul, thumbnail | `research_current_trends`, `save_content_brief` | Clara |
 | `Clara_Scriptwriter` | naskah retensi tinggi, A-Roll/B-Roll | `save_production_script`, `save_scene_breakdown` | Damon |
 | `Damon_RealityChecker` | QC + hak veto (2 gerbang) | `inspect_rendered_output` | Clara / Bima / Raka / Sora |
-| `Bima_StudioPM` | gatekeeper human-in-the-loop | `request_and_check_creator_files` | Raka |
+| `Bima_StudioPM` | gatekeeper human-in-the-loop | `request_and_check_creator_files`, `send_direct_alert_to_creator` | Raka |
 | `Raka_Producer` | render ffmpeg 1080p60 / Remotion per scene | `assemble_and_render_video`, `assemble_story_from_script` | Damon |
-| `Sora_YouTubePublisher` | SEO + upload YouTube | `upload_to_youtube` | — (menutup rapat) |
+| `Sora_YouTubePublisher` | SEO + upload YouTube | `upload_to_youtube`, `send_direct_alert_to_creator` | — (menutup rapat) |
 
 Persona tiap bot adalah file Markdown di [`agents/`](agents) (gaya
 `msitarzewski/agency-agents`, lengkap dengan frontmatter YAML). Ubah nada/kriteria bot
@@ -182,6 +184,13 @@ Semua lewat environment (atau `.env`, dimuat otomatis):
 | `STUDIO_EDGE_TTS_VOICE` | `id-ID-ArdiNeural` | Suara Edge-TTS (`id-ID-GadisNeural` untuk wanita) |
 | `STUDIO_TTS_RATE` | `+5%` | Kecepatan bicara TTS |
 | `STUDIO_REQUIRE_AROLL` | `1` | `0` = faceless: jangan tunggu rekaman Creator |
+| **Notifikasi Telegram** | | |
+| `STUDIO_TELEGRAM_TOKEN` | — | Token bot (alias: `TELEGRAM_BOT_TOKEN`) |
+| `STUDIO_TELEGRAM_CHAT_ID` | — | Chat ID Anda (alias: `TELEGRAM_CHAT_ID`) |
+| **Visual otomatis (B-Roll)** | | |
+| `STUDIO_BROLL_PROVIDER` | `auto` | `auto`/`dalle`/`flux`/`pexels`/`gradient`/`off` |
+| `STUDIO_IMAGE_API_KEY` | — | Kunci gambar OpenAI (fallback: `OPENAI_API_KEY`); kosong = Flux gratis |
+| `PEXELS_API_KEY` | — | Stock video gratis dari pexels.com/api |
 | **Riset tren (Vito)** | | |
 | `STUDIO_YOUTUBE_API_KEY` | — | YouTube Data API v3 (API key saja, tanpa OAuth) |
 | `TAVILY_API_KEY` | — | Fallback tren web |
@@ -284,6 +293,7 @@ menyimpan dua artefak dari materi yang sama:
       "narration_text": "Pernahkah kamu membayangkan kantor yang berjalan sendiri saat kamu tidur?",
       "visual_cue": "Dark futuristic server room with glowing neon nodes",
       "broll_asset": "broll_server.mp4",
+      "visual_mode": "AI_IMAGE",
       "highlight_words": ["berjalan sendiri", "tidur"]
     },
     {
@@ -573,6 +583,71 @@ proses menangani webhook sekaligus memantau folder `input_creator/`.
 
 ---
 
+## 7c. Notifikasi Telegram & visual otomatis
+
+### Telegram: laporan naskah + link YouTube
+
+Cukup isi dua variabel (nama KRA juga diterima), lalu semua kabar datang ke HP:
+
+```bash
+export STUDIO_TELEGRAM_TOKEN="7123456789:AAH..."   # atau TELEGRAM_BOT_TOKEN
+export STUDIO_TELEGRAM_CHAT_ID="987654321"          # atau TELEGRAM_CHAT_ID
+```
+
+| Momen | Yang dikirim |
+|---|---|
+| Naskah lulus Damon | judul, jumlah scene, mode produksi (menunggu A-Roll / full auto) — plus **lampiran** `script_production.json` dan `creator_todo_list.md` |
+| Mulai render | satu baris: Raka sedang TTS → Whisper → Remotion → concat |
+| Selesai upload | judul, privasi, engine, **link `youtu.be`** dan **link YouTube Studio** |
+
+Implementasinya di `studio/notify.py` (`notify_script_ready`, `notify_youtube_uploaded`,
+`send_html`, `send_document`) dan dipanggil otomatis oleh daemon. Pengiriman file memakai
+multipart `urllib`, jadi **tidak menambah dependensi** (`requests` tidak dibutuhkan).
+
+Bima dan Sora juga memegang tool `send_direct_alert_to_creator(bot_sender_name, message_text)`
+untuk pesan ad-hoc ke Telegram Anda; isinya di-escape HTML supaya aman.
+
+> Kejujuran status: receipt simulasi (`UPLOADED_SIMULATION`, tanpa `video_id`) dikirim
+> sebagai **"UPLOAD SIMULASI (BUKAN LIVE)"** — bukan "video berhasil tayang".
+
+### Visual otomatis: 3 tier + fallback
+
+Scene `REMOTION_DYNAMIC` yang tidak punya `broll_asset`/`bg_image` manual tidak lagi
+dibiarkan gelap. `studio/broll.py` (`ensure_visual`) mencoba berurutan:
+
+| Tier | Engine | Syarat | Hasil |
+|---|---|---|---|
+| 1 | **DALL·E 3** | `STUDIO_IMAGE_API_KEY`/`OPENAI_API_KEY` | `auto_bg_<scene>.jpg` (1792×1024) |
+| 2 | **Flux Pollinations** | tanpa key, tanpa biaya | `auto_bg_<scene>.jpg` (1920×1080) |
+| 3 | **Pexels stock video** | `visual_mode: "STOCK_VIDEO"` + `PEXELS_API_KEY` | `auto_broll_<scene>.mp4` (HD 1920) |
+| 4 | **Kanvas gelap FFmpeg** | ffmpeg ada, jaringan mati | `auto_bg_<scene>.jpg` |
+
+Aturan mainnya:
+
+- hanya untuk scene non-`CREATOR_AROLL` yang **belum** punya aset manual (aset manual
+  selalu menang — tidak ada API yang dipanggil);
+- file hasilnya di-cache di `input_creator/`, jadi render ulang tidak memanggil API lagi;
+- kegagalan **tidak** menghentikan render: catatan seperti `flux: GAGAL (HTTP 503)`
+  masuk ke `scenes[].notes`, dan scene memakai latar gradien Remotion;
+- nama file disanitasi dari `scene_id`, jadi `../../etc/passwd` tidak bisa keluar folder.
+
+```json
+{
+  "scene_id": "scene_02_data",
+  "type": "REMOTION_DYNAMIC",
+  "narration_text": "Pusat data mereka memproses jutaan keputusan per detik...",
+  "visual_cue": "server room data center blinking lights",
+  "visual_mode": "STOCK_VIDEO",
+  "highlight_words": ["jutaan keputusan"]
+}
+```
+
+`visual_mode` divalidasi saat menyimpan naskah (`AI_IMAGE` default), begitu juga
+`visual_cue` yang kini diperlakukan sebagai **prompt visual** — lihat aturan di persona
+Clara (§2).
+
+---
+
 ## 8. Memori jangka panjang
 
 `workspace/studio.db` (SQLite, WAL, tanpa dependensi tambahan):
@@ -637,10 +712,11 @@ studio/
   media.py                    # pipeline ffmpeg/auto-editor/Whisper/Remotion + ffprobe
   story.py                    # jembatan JSON: naskah Clara → Whisper → Remotion → concat
   tts.py                      # voiceover faceless: ElevenLabs → Edge-TTS → loudnorm -14 LUFS
+  broll.py                    # visual otomatis: DALL·E → Flux → Pexels → kanvas FFmpeg
   state.py                    # pipeline_state.json atomik + gate untuk scheduler n100n
   research.py                 # tren nyata: YouTube Data API, Tavily, SerpAPI
   memory.py                   # SQLite: runs, videos, topics, prompt_context()
-  notify.py                   # Telegram Bot API (urllib) + konsol
+  notify.py                   # Telegram: pesan HTML, lampiran multipart, laporan naskah/upload
   daemon.py                   # antrean job, watcher, scheduler, perintah Telegram
   api.py                      # FastAPI: /kra/schedule/1..3, /kra/n100n-trigger, /health, /status
   report.py                   # transkrip & ringkasan run
@@ -648,7 +724,7 @@ studio/
 agents/*.md                   # persona 6 bot
 remotion_template/            # Root.tsx + StoryScene.tsx untuk kantor-rama-ai/remotion_studio
 schedules/                    # kra_autonomous_workflow.json (n8n dual-loop, Asia/Jakarta)
-tests/                        # 138 test: unit, daemon, API, story, TTS, state, e2e GroupChat
+tests/                        # 174 test: unit, daemon, API, story, TTS, state, notifikasi, B-Roll
 requirements-daemon.txt       # fastapi + uvicorn (mode --serve)
 requirements-media.txt        # openai-whisper (+ catatan ffmpeg/auto-editor/remotion)
 ```
@@ -683,7 +759,7 @@ tetap macet, `max_round` menghentikannya dan laporan berstatus
 
 ```bash
 pip install -r requirements-dev.txt
-pytest            # 138 test
+pytest            # 174 test
 ruff check .
 ```
 
@@ -698,6 +774,8 @@ ruff check .
 - `tests/test_story.py` — validasi skema naskah, ekstraksi kata Whisper, staging `kra_temp`, render Remotion (npx palsu), concat, fallback FFmpeg, dan narasi TTS faceless.
 - `tests/test_tts.py` — ElevenLabs (transport palsu), fallback Edge-TTS, normalisasi loudnorm, dan kegagalan yang dilaporkan jujur.
 - `tests/test_state.py` — transisi status atomik dan matriks `gate()` (file, 0 byte, busy, faceless).
+- `tests/test_notify.py` — pesan HTML Telegram, lampiran multipart, laporan naskah/upload, dan penandaan "SIMULASI".
+- `tests/test_broll.py` — empat tier visual dengan transport palsu, cache, sanitasi nama, dan kegagalan jujur.
 - `tests/test_group_chat_e2e.py` — **GroupChat sungguhan** dengan `OpenAIWrapper.create`
   yang dipalsukan: membuktikan tool dieksekusi oleh bot yang tepat, loop
   Damon-menolak-Clara berjalan, dan rapat berhenti karena `PIPELINE_COMPLETE`, bukan
@@ -733,6 +811,11 @@ dijawab deterministik, tetapi seluruh mesin AutoGen tetap berjalan.
 | Suara TTS terlalu cepat/lambat | Atur `STUDIO_TTS_RATE` (mis. `+0%`, `-5%`); Edge-TTS memakai format persen bertanda |
 | ElevenLabs balas 401/429 | Kuota/kunci salah; pipeline otomatis jatuh ke Edge-TTS dan mencatatnya di `attempts` |
 | Caption tidak sinkron dengan narasi | Whisper harus jalan (`pip install -r requirements-media.txt`); tanpa Whisper `words` kosong dan caption hilang |
+| Notifikasi Telegram tidak masuk | Isi `STUDIO_TELEGRAM_TOKEN` + `STUDIO_TELEGRAM_CHAT_ID` (atau `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`); kirim `/start` ke bot dulu. `--doctor` menampilkan kanal aktif |
+| Lampiran naskah tidak terkirim | File `script_production.json` harus ada di `workspace/`; kanal konsol memang tidak mengirim file (dicatat di log) |
+| `dalle: GAGAL` / `flux: GAGAL` | Cek jaringan/kuota. Render tetap jalan dengan tier berikutnya; cek `scenes[].notes` di `.render.json` |
+| Gambar B-Roll tidak muncul | `STUDIO_BROLL_PROVIDER=off`? `visual_cue` kosong? Scene sudah punya `broll_asset` manual? |
+| `visual_mode` ditolak | Hanya `AI_IMAGE` atau `STOCK_VIDEO`; perbaiki naskah lalu simpan ulang |
 | `ready_to_produce` selalu false | Cek `pipeline_status`: `SCRIPTING_IN_PROGRESS`/`RENDERING` = sibuk, `PUBLISHED_COMPLETE`/`ERROR` = tunggu jadwal 08:00 berikutnya |
 | Video Creator diproses dua kali | Seharusnya tidak terjadi: file diarsipkan ke `input_creator/processed/`. Hapus `workspace/pipeline_state.json` hanya bila status tertinggal setelah crash |
 

@@ -70,6 +70,10 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "Upload video final ke YouTube Data API v3 dengan metadata SEO + Chapters. "
         "Tanpa client_secret.json, tool menulis receipt simulasi."
     ),
+    "send_direct_alert_to_creator": (
+        "Kirim pesan/link langsung ke Telegram pribadi Creator. Panggil setelah upload "
+        "untuk membagikan link YouTube, atau saat butuh keputusan cepat dari Creator."
+    ),
 }
 
 
@@ -219,7 +223,7 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
         default_reply=(
             "Raka_Producer, file Creator sudah saya verifikasi ada di ./input_creator/. Silakan render."
         ),
-        tools=("request_and_check_creator_files",),
+        tools=("request_and_check_creator_files", "send_direct_alert_to_creator"),
         handoff=("Raka_Producer",),
     ),
     AgentSpec(
@@ -280,7 +284,7 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
         default_reply=(
             "Upload sudah saya proses. Video final ada di ./output_ready/. PIPELINE_COMPLETE"
         ),
-        tools=("upload_to_youtube",),
+        tools=("upload_to_youtube", "send_direct_alert_to_creator"),
         handoff=("Damon_RealityChecker",),
     ),
 )

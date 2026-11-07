@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .broll import VisualAsset, ensure_visual
 from .config import Settings
 from .media import (
     Capabilities,
@@ -48,6 +49,8 @@ _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 TTSFn = Any  # Callable[[Settings, str, Path, ...], Narration]
+BrollFn = Any  # Callable[[Settings, str, str, ...], VisualAsset]
+VISUAL_MODES = ("AI_IMAGE", "STOCK_VIDEO")
 
 
 class StoryError(RuntimeError):
@@ -70,6 +73,7 @@ class Scene:
     highlight_words: list[str] = field(default_factory=list)
     bg_image: str = ""
     voice_id: str = ""
+    visual_mode: str = "AI_IMAGE"
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], index: int) -> Scene:
@@ -85,6 +89,7 @@ class Scene:
             highlight_words=[str(word) for word in (data.get("highlight_words") or [])],
             bg_image=str(data.get("bg_image") or ""),
             voice_id=str(data.get("voice_id") or ""),
+            visual_mode=str(data.get("visual_mode") or "AI_IMAGE").upper(),
         )
 
     @property
@@ -163,6 +168,11 @@ def validate_story(data: Any) -> Validation:
             problems.append(f"{scene.scene_id}: 'source_video' harus nama file relatif, bukan path luar")
         if scene.broll_asset and not _is_safe_relative(scene.broll_asset):
             problems.append(f"{scene.scene_id}: 'broll_asset' harus nama file relatif, bukan path luar")
+        if scene.visual_mode not in VISUAL_MODES:
+            problems.append(
+                f"{scene.scene_id}: 'visual_mode' '{scene.visual_mode}' tidak dikenal "
+                f"(pilih {', '.join(VISUAL_MODES)})"
+            )
         if scene.bg_image and not _is_safe_relative(scene.bg_image):
             problems.append(f"{scene.scene_id}: 'bg_image' harus nama file relatif, bukan path luar")
         if scene.type == "CREATOR_AROLL" and not scene.media:
@@ -229,6 +239,7 @@ class SceneResult:
     source: str = ""
     audio: str = ""
     audio_provider: str = ""
+    visual_tier: str = ""
     duration_seconds: float = 0.0
     words: int = 0
     notes: list[str] = field(default_factory=list)
@@ -243,6 +254,7 @@ class SceneResult:
             "source": self.source,
             "audio": self.audio,
             "audio_provider": self.audio_provider,
+            "visual_tier": self.visual_tier,
             "duration_seconds": round(self.duration_seconds, 2),
             "words": self.words,
             "notes": self.notes,
@@ -263,12 +275,14 @@ class StoryResult:
     elapsed_seconds: float = 0.0
     workdir: str = ""
     tts_providers: list[str] = field(default_factory=list)
+    visual_tiers: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "file": str(self.output),
             "engine": self.engine,
             "tts_providers": self.tts_providers,
+            "visual_tiers": self.visual_tiers,
             "project_id": self.project_id,
             "title": self.title,
             "fps": self.fps,
@@ -295,6 +309,7 @@ class StoryBuilder:
         *,
         pipeline: MediaPipeline | None = None,
         tts: TTSFn | None = None,
+        broll: BrollFn | None = None,
     ) -> None:
         self.settings = settings
         self.caps = caps or detect_capabilities(settings)
@@ -302,6 +317,7 @@ class StoryBuilder:
         self.workdir = self.pipeline.workdir / "story"
         self.workdir.mkdir(parents=True, exist_ok=True)
         self.tts = tts or synthesize
+        self.broll = broll or ensure_visual
         self._words_cache: dict[str, tuple[list[dict[str, Any]], float]] = {}
 
     # -------------------------------------------------------------- lokasi
@@ -385,6 +401,21 @@ class StoryBuilder:
             )
         except TTSError as exc:
             return Narration(provider="", path=Path(), notes=[f"TTS gagal: {str(exc)[:200]}"])
+
+    def _visualize(self, scene: Scene, index: int) -> VisualAsset | None:
+        """Buat B-Roll/gambar latar otomatis untuk scene tanpa aset manual."""
+        try:
+            return self.broll(
+                self.settings,
+                scene.scene_id,
+                scene.visual_cue or scene.narration_text,
+                mode=scene.visual_mode,
+                index=index,
+                outdir=self.settings.paths.input_creator,
+                ffmpeg=self.caps.ffmpeg,
+            )
+        except Exception as exc:  # noqa: BLE001 - visual gagal tidak boleh menghentikan render
+            return VisualAsset(notes=[f"visual otomatis gagal: {type(exc).__name__}: {str(exc)[:160]}"])
 
     @staticmethod
     def _props(
@@ -572,15 +603,31 @@ class StoryBuilder:
                 scene_id=scene.scene_id, type=scene.type, composition_id=scene.composition_id
             )
 
-            # 1) Tentukan aset visual: A-Roll Creator > B-Roll > gambar latar.
+            # 1) Tentukan aset visual: A-Roll Creator > aset manual > visual otomatis > fallback.
             source = self.resolve_asset(scene.media) if scene.media else None
-            if scene.media and source is None:
+            image = self.resolve_asset(scene.bg_image) if scene.bg_image else None
+            missing_media = bool(scene.media) and source is None
+            missing_image = bool(scene.bg_image) and image is None
+
+            # 1b) Scene dinamis tanpa aset manual → generate B-Roll/gambar dari visual_cue.
+            if scene.type != "CREATOR_AROLL" and source is None and image is None:
+                visual = self._visualize(scene, index)
+                if visual is not None:
+                    scene_result.notes.extend(visual.notes)
+                    if visual.ok and visual.path is not None:
+                        scene_result.visual_tier = visual.tier
+                        result.visual_tiers.append(visual.tier)
+                        if visual.kind == "video":
+                            source = visual.path
+                        else:
+                            image = visual.path
+
+            if missing_media and source is None:
                 scene_result.notes.append(
                     f"aset '{scene.media}' tidak ditemukan; memakai '{fallback_source}' bila ada"
                 )
                 source = fallback
-            image = self.resolve_asset(scene.bg_image) if scene.bg_image else None
-            if scene.bg_image and image is None:
+            if missing_image and image is None:
                 scene_result.notes.append(f"gambar latar '{scene.bg_image}' tidak ditemukan")
 
             uses_creator_video = scene.type == "CREATOR_AROLL" and source is not None

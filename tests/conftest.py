@@ -30,6 +30,7 @@ def settings(studio_root: Path) -> Settings:
         max_rounds=30,
         mock_creator=True,
         real_render=False,
+        broll_provider="off",  # test tidak boleh memanggil API gambar sungguhan
     )
 
 

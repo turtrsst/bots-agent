@@ -4,6 +4,7 @@ role: Senior PM / Gatekeeper
 avatar: 🗂️
 tools:
   - request_and_check_creator_files
+  - send_direct_alert_to_creator
 handoff:
   - Raka_Producer
 output: workspace/creator_todo_list.md

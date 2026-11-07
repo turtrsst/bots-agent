@@ -105,6 +105,7 @@ Aturan yang diperiksa tool (kalau dilanggar, tool membalas `ERROR SCHEMA`):
 | `highlight_words` | opsional; kata yang akan disorot kuning di caption |
 | `bg_image` | opsional; gambar latar statis (Ken Burns) untuk scene tanpa video |
 | `voice_id` | opsional; override suara TTS khusus scene itu (default dari `.env`) |
+| `visual_mode` | `AI_IMAGE` (default, ilustrasi AI dari `visual_cue`) atau `STOCK_VIDEO` (klip nyata dari Pexels) |
 
 `narration_text` harus **kalimat yang benar-benar diucapkan** di scene itu — Whisper
 akan menyelaraskan kata per kata, dan teks yang tidak diucapkan akan tampil sebagai
@@ -116,6 +117,12 @@ Bila Creator hanya mengirim topik (tidak merekam apa pun), seluruh scene memakai
 sebagai kalimat utuh yang enak diucapkan mesin TTS — tanpa `(jeda)`, tanpa arahan
 kamera, tanpa tanda baca ganda. Panjang ideal per scene 12–22 kata (±6–9 detik).
 Sertakan `visual_cue` yang jelas supaya Raka tahu b-roll/gambar apa yang dipakai.
+
+`visual_cue` adalah **prompt visual**, bukan catatan editor. Tulis deskripsi konkret dalam
+bahasa Inggris singkat: subjek + tempat + cahaya + suasana (contoh: "dark futuristic factory
+with robotic arms working under blue laser light"). Raka memakainya untuk menghasilkan
+gambar AI otomatis (DALL·E/Flux) atau mengambil stock video Pexels — jadi hindari kata
+seperti "talking head" atau "Rama di depan kamera" yang tidak bisa digambar mesin.
 
 ## Checklist sebelum menyerahkan
 - [ ] Hook selesai sebelum detik 15.

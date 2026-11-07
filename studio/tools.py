@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import html
 import json
 import os
 import sys
@@ -51,6 +52,7 @@ TOOL_NAMES: tuple[str, ...] = (
     "assemble_and_render_video",
     "inspect_rendered_output",
     "upload_to_youtube",
+    "send_direct_alert_to_creator",
 )
 
 
@@ -74,10 +76,20 @@ def _fmt_bytes(size: int) -> str:
 class StudioTools:
     """Kumpulan tool; satu instance dipakai bersama semua bot dalam satu run."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, notifier: Any | None = None) -> None:
         self.settings = settings
         self.paths = settings.paths.ensure()
         self._caps = None
+        self._notifier = notifier
+
+    @property
+    def notifier(self):
+        """Kanal notifikasi (Telegram/konsol) — dibangun sekali, bisa di-inject saat test."""
+        if self._notifier is None:
+            from .notify import build_notifier
+
+            self._notifier = build_notifier(self.settings)
+        return self._notifier
 
     @property
     def capabilities(self):
@@ -125,6 +137,7 @@ class StudioTools:
             "assemble_story_from_script",
             "inspect_rendered_output",
             "upload_to_youtube",
+            "send_direct_alert_to_creator",
         ):
             impl = getattr(self, name)
 
@@ -675,6 +688,7 @@ class StudioTools:
                 "tags": tag_list,
                 "chapters_detected": len(timestamps),
                 "warnings": warnings,
+                "video_url": "",
                 "studio_url": "https://studio.youtube.com/",
                 "next_step": "Taruh client_secret.json (OAuth Desktop App) di root proyek untuk upload live.",
                 "created_at": _now(),
@@ -699,6 +713,7 @@ class StudioTools:
             "status": "UPLOADED_LIVE",
             "video_id": video_id,
             "url": f"https://youtu.be/{video_id}",
+            "video_url": f"https://youtu.be/{video_id}",
             "studio_url": f"https://studio.youtube.com/video/{video_id}/edit",
             "title": title,
             "privacy": privacy,
@@ -711,6 +726,33 @@ class StudioTools:
         )
         self._log("upload_youtube", mode="live", status="ok", video_id=video_id)
         return f"UPLOAD YOUTUBE SUKSES: {json.dumps(receipt, ensure_ascii=False)}"
+
+    def send_direct_alert_to_creator(
+        self,
+        bot_sender_name: Annotated[
+            str,
+            "Nama bot pengirim, mis. 'Bima_StudioPM' atau 'Sora_YouTubePublisher'",
+        ],
+        message_text: Annotated[
+            str,
+            "Isi laporan singkat atau link YouTube yang dikirim ke Telegram Creator",
+        ],
+    ) -> str:
+        """Kirim pesan langsung ke Telegram Creator (Rama)."""
+        from .notify import send_html
+
+        text = (message_text or "").strip()
+        if not text:
+            return "ERROR ALERT: pesan kosong, tidak ada yang dikirim."
+        sender = html.escape((bot_sender_name or "Super Bot KRA").strip())[:80]
+        body = f"💬 <b>Pesan dari {sender}:</b>\n\n{html.escape(text)}"
+        if send_html(self.notifier, body):
+            self._log("telegram_alert", sender=sender, length=len(text))
+            return "BERHASIL DIKIRIM KE TELEGRAM CREATOR"
+        return (
+            "GAGAL MENGIRIM KE TELEGRAM (cek STUDIO_TELEGRAM_TOKEN / STUDIO_TELEGRAM_CHAT_ID "
+            "atau TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)"
+        )
 
     def _youtube_insert(
         self, video: Path, title: str, description: str, tags: list[str], privacy: str

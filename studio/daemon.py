@@ -29,7 +29,14 @@ from typing import Any
 from .config import Settings
 from .media import Capabilities, detect_capabilities
 from .memory import MemoryStore, new_run_id
-from .notify import Notifier, build_notifier, format_job_result
+from .notify import (
+    Notifier,
+    build_notifier,
+    format_job_result,
+    notify_script_ready,
+    notify_youtube_uploaded,
+    send_html,
+)
 from .office import RunSummary, build_office
 from .state import (
     BUSY,
@@ -388,6 +395,7 @@ class Daemon:
                 expected_file="a_roll_raw.mp4",
                 script_file="script_production.json",
             )
+            notify_script_ready(self.notifier, self.settings.paths, require_aroll=True)
             self.notifier.send(self._creator_checklist(summary, job))
         elif job.require_aroll and not summary.completed and not summary.awaiting_creator:
             self.state.update(
@@ -413,6 +421,7 @@ class Daemon:
                 script_file="script_production.json",
                 faceless=not job.require_aroll,
             )
+            notify_script_ready(self.notifier, self.settings.paths, require_aroll=False)
             self.notifier.send(
                 format_job_result(
                     title="Naskah siap dirender"
@@ -437,6 +446,11 @@ class Daemon:
 
         raw_name = Path(job.raw_file).name
         self.state.update(RENDERING, job_id=job.id, run_id=run_id, raw_file=raw_name)
+        send_html(
+            self.notifier,
+            "⚙️ <b>[KRA PROD]</b> Raka sedang merender: narasi TTS/audio Creator, Whisper, "
+            "Remotion, lalu concat. Laporan otomatis dikirim setelah QC Damon selesai.",
+        )
         office = self.office_factory(
             self.settings, stage="production", memory_context=self.memory.prompt_context()
         )
@@ -465,6 +479,7 @@ class Daemon:
                 video="output_ready/final_render.mp4",
             )
             self._archive_processed(job.raw_file)
+            notify_youtube_uploaded(self.notifier, self.settings.paths)
             self.notifier.send(
                 format_job_result(
                     title="✅ Video selesai diproduksi",

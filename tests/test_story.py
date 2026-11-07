@@ -382,3 +382,112 @@ def test_creator_aroll_scene_skips_tts(
     aroll = result.scenes[1]
     assert aroll.audio_provider == ""
     assert aroll.audio == ""
+
+
+# ------------------------------------------------ visual otomatis (B-Roll)
+def test_visual_mode_is_validated() -> None:
+    data = json.loads(json.dumps(FACELESS))
+    data["scenes"][0]["visual_mode"] = "HOLOGRAM"
+    report = validate_story(data)
+    assert not report.ok
+    assert any("visual_mode" in problem for problem in report.problems)
+
+
+def test_visual_mode_defaults_to_ai_image() -> None:
+    report = validate_story(json.loads(json.dumps(FACELESS)))
+    assert report.ok
+    assert report.script is not None
+    assert report.script.scenes[0].visual_mode == "AI_IMAGE"
+
+
+def _broll_script(mode: str = "AI_IMAGE") -> dict:
+    data = json.loads(json.dumps(FACELESS))
+    data["scenes"][0].pop("bg_image", None)  # tidak ada aset manual → generator dipanggil
+    data["scenes"][0]["visual_mode"] = mode
+    return data
+
+
+def _fake_broll(kind: str, calls: list[dict]):
+    from studio.broll import VisualAsset
+
+    def broll(settings, scene_id, cue, **kwargs):
+        calls.append({"scene_id": scene_id, "cue": cue, **kwargs})
+        suffix = ".mp4" if kind == "video" else ".jpg"
+        target = Path(kwargs["outdir"]) / f"auto_{'broll' if kind == 'video' else 'bg'}_{scene_id}{suffix}"
+        target.write_bytes(b"visual")
+        return VisualAsset(kind=kind, path=target, tier="pexels" if kind == "video" else "flux",
+                           prompt=cue, notes=[f"{'pexels' if kind == 'video' else 'flux'}: {target.name}"])
+
+    return broll
+
+
+@pytest.mark.parametrize(
+    ("kind", "mode", "tier", "prop"),
+    [("image", "AI_IMAGE", "flux", "bgImageSrc"), ("video", "STOCK_VIDEO", "pexels", "videoSrc")],
+)
+def test_scene_without_asset_gets_generated_visual(
+    story_settings: Settings,
+    fake_ffmpeg: Path,
+    fake_npx: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    mode: str,
+    tier: str,
+    prop: str,
+) -> None:
+    monkeypatch.setattr("studio.story.shutil.which", lambda _name: None)
+    caps = Capabilities(ffmpeg=str(fake_ffmpeg), npx=str(fake_npx), remotion_dir=str(story_settings.remotion_dir))
+    calls: list[dict] = []
+    builder = StoryBuilder(story_settings, caps, broll=_fake_broll(kind, calls))
+
+    result = builder.build(
+        _write_story(story_settings, _broll_script(mode)),
+        story_settings.paths.output_ready / "final.mp4",
+    )
+
+    assert calls and calls[0]["scene_id"] == "scene_1_hook"
+    assert calls[0]["mode"] == mode
+    assert calls[0]["cue"].startswith("Dark server room")
+    scene = result.scenes[0]
+    assert scene.visual_tier == tier
+    assert result.visual_tiers == [tier]
+    assert any(tier in note for note in scene.notes)
+    props_path = next(story_settings.paths.workspace.glob("props_*_scene_1_hook.json"))
+    props = json.loads(props_path.read_text(encoding="utf-8"))
+    assert props[prop].startswith("scene_1_hook__auto_")
+    assert list((Path(story_settings.remotion_dir) / "public" / "kra_temp").iterdir()) == []
+
+
+def test_manual_asset_skips_generator(
+    story_settings: Settings, fake_ffmpeg: Path, fake_npx: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("studio.story.shutil.which", lambda _name: None)
+    caps = Capabilities(ffmpeg=str(fake_ffmpeg), npx=str(fake_npx), remotion_dir=str(story_settings.remotion_dir))
+    _assets(story_settings)  # broll_server.mp4 tersedia
+    calls: list[dict] = []
+
+    result = StoryBuilder(story_settings, caps, broll=_fake_broll("image", calls)).build(
+        _write_story(story_settings), story_settings.paths.output_ready / "final.mp4"
+    )
+
+    assert calls == []  # aset manual menang
+    assert result.visual_tiers == []
+    assert result.scenes[0].source.endswith("broll_server.mp4")
+
+
+def test_generator_error_does_not_break_render(
+    story_settings: Settings, fake_ffmpeg: Path, fake_npx: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("studio.story.shutil.which", lambda _name: None)
+    caps = Capabilities(ffmpeg=str(fake_ffmpeg), npx=str(fake_npx), remotion_dir=str(story_settings.remotion_dir))
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("API gambar tumbang")
+
+    result = StoryBuilder(story_settings, caps, broll=boom).build(
+        _write_story(story_settings, _broll_script()), story_settings.paths.output_ready / "final.mp4"
+    )
+
+    assert result.ok
+    assert any("visual otomatis gagal" in note for note in result.scenes[0].notes)
+    assert result.visual_tiers == []

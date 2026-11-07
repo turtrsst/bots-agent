@@ -130,6 +130,10 @@ class Settings:
     tts_rate: str = "+5%"
     # --- pipeline state untuk n100n
     require_creator_aroll: bool = True
+    # --- visual otomatis (B-Roll generator)
+    broll_provider: str = "auto"
+    image_api_key: str = ""
+    pexels_api_key: str = ""
 
     # ------------------------------------------------------------------ setup
     @classmethod
@@ -180,8 +184,8 @@ class Settings:
             schedule_topic=pick("STUDIO_SCHEDULE_TOPIC"),
             watch_interval=max(1.0, _env_float(source, "STUDIO_WATCH_INTERVAL", 5.0)),
             upload_settle=max(0.0, _env_float(source, "STUDIO_UPLOAD_SETTLE", 4.0)),
-            telegram_token=pick("STUDIO_TELEGRAM_TOKEN"),
-            telegram_chat_id=pick("STUDIO_TELEGRAM_CHAT_ID"),
+            telegram_token=pick("STUDIO_TELEGRAM_TOKEN", "TELEGRAM_BOT_TOKEN"),
+            telegram_chat_id=pick("STUDIO_TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID"),
             notify=(pick("STUDIO_NOTIFY") or "auto").lower(),
             youtube_api_key=pick("STUDIO_YOUTUBE_API_KEY", "YOUTUBE_API_KEY"),
             tavily_api_key=pick("STUDIO_TAVILY_API_KEY", "TAVILY_API_KEY"),
@@ -192,6 +196,9 @@ class Settings:
             edge_tts_voice=pick("STUDIO_EDGE_TTS_VOICE") or "id-ID-ArdiNeural",
             tts_rate=pick("STUDIO_TTS_RATE") or "+5%",
             require_creator_aroll=env_flag("STUDIO_REQUIRE_AROLL", True, source),
+            broll_provider=(pick("STUDIO_BROLL_PROVIDER") or "auto").lower(),
+            image_api_key=pick("STUDIO_IMAGE_API_KEY", "OPENAI_IMAGE_API_KEY", "OPENAI_API_KEY"),
+            pexels_api_key=pick("STUDIO_PEXELS_API_KEY", "PEXELS_API_KEY"),
         )
 
     def with_changes(self, **kwargs) -> Settings:
@@ -245,8 +252,11 @@ class Settings:
             if key
         ]
         tts = "elevenlabs" if self.elevenlabs_api_key else "edge"
+        visual = self.broll_provider
+        if visual == "auto":
+            visual = "dalle" if self.image_api_key else "flux"
         return (
             f"model={self.model} | endpoint={base} | temperature={self.temperature} | "
             f"max_rounds={self.max_rounds} | api_key={self.masked_api_key()} | gate={mode} | "
-            f"riset={','.join(research) or 'off'} | tts={tts} | root={self.paths.root}"
+            f"riset={','.join(research) or 'off'} | tts={tts} | broll={visual} | root={self.paths.root}"
         )

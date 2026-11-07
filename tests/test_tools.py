@@ -189,3 +189,61 @@ def test_render_tool_exposes_remotion_hook(settings: Settings) -> None:
     assert "hook_title" in signature.parameters
     assert "remotion_composition" in signature.parameters
     assert signature.parameters["hook_title"].default == ""
+
+
+# ------------------------------------------------- notifikasi Telegram (tool)
+class FakeNotifier:
+    supports_inbound = False
+
+    def __init__(self, ok: bool = True) -> None:
+        self.ok = ok
+        self.html: list[str] = []
+        self.documents: list[str] = []
+
+    def send(self, text: str, *, silent: bool = False) -> bool:
+        return self.ok
+
+    def send_html(self, text: str, *, silent: bool = False) -> bool:
+        self.html.append(text)
+        return self.ok
+
+    def send_document(self, path, caption: str = "") -> bool:
+        self.documents.append(Path(path).name)
+        return self.ok
+
+
+def test_send_direct_alert_to_creator(settings: Settings) -> None:
+    notifier = FakeNotifier()
+    studio = StudioTools(settings, notifier=notifier)
+
+    result = studio.send_direct_alert_to_creator("Sora_YouTubePublisher", "Video live: https://youtu.be/x")
+
+    assert result == "BERHASIL DIKIRIM KE TELEGRAM CREATOR"
+    assert notifier.html and "Sora_YouTubePublisher" in notifier.html[0]
+    assert "https://youtu.be/x" in notifier.html[0]
+
+
+def test_send_direct_alert_escapes_and_rejects_empty(settings: Settings) -> None:
+    notifier = FakeNotifier()
+    studio = StudioTools(settings, notifier=notifier)
+
+    assert studio.send_direct_alert_to_creator("Bima", "   ").startswith("ERROR ALERT")
+    assert not notifier.html
+
+    studio.send_direct_alert_to_creator("Bima_StudioPM", "<script>alert(1)</script>")
+    assert "&lt;script&gt;" in notifier.html[-1]
+
+
+def test_send_direct_alert_reports_failure(settings: Settings) -> None:
+    studio = StudioTools(settings, notifier=FakeNotifier(ok=False))
+    result = studio.send_direct_alert_to_creator("Bima", "Halo")
+    assert result.startswith("GAGAL MENGIRIM KE TELEGRAM")
+
+
+def test_alert_tool_exposed_to_bots(settings: Settings) -> None:
+    from studio.office import AGENT_SPECS
+
+    owners = {
+        spec.key for spec in AGENT_SPECS if "send_direct_alert_to_creator" in spec.tools
+    }
+    assert owners == {"bima", "sora"}
