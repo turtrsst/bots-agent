@@ -384,7 +384,7 @@ def notify_youtube_uploaded(notifier: Notifier, paths: StudioPaths) -> str:
         engine = "FFmpeg (fallback, tanpa Remotion)"
     elif engine == "remotion":
         engine = "Whisper + Remotion + Concat"
-    engine = engine or "Whisper + Remotion + Concat"
+    engine = engine or "belum tercatat (cek final_render.render.json)"
 
     ok = send_html(
         notifier,

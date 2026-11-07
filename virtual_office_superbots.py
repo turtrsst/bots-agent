@@ -239,10 +239,24 @@ def main(argv: list[str] | None = None) -> int:
         return 130
 
     print_summary(summary)
+    _notify_stage_result(settings, summary)
     if not summary.completed:
         print("⚠️  Rapat berhenti sebelum PIPELINE_COMPLETE. Cek transkrip untuk melihat titik macetnya.\n")
         return 1
     return 0
+
+
+def _notify_stage_result(settings, summary) -> None:
+    """Kirim laporan naskah/upload ke Telegram juga saat dijalankan manual (bukan daemon)."""
+    from studio.notify import build_notifier, notify_script_ready, notify_youtube_uploaded
+
+    notifier = build_notifier(settings)
+    if summary.awaiting_creator or summary.completed:
+        notify_script_ready(
+            notifier, settings.paths, require_aroll=settings.require_creator_aroll
+        )
+    if summary.completed:
+        notify_youtube_uploaded(notifier, settings.paths)
 
 
 def run_long_lived(settings, args) -> int:
