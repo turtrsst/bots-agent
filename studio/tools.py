@@ -33,6 +33,7 @@ from typing import Annotated, Any
 from .config import Settings, env_flag
 from .media import MediaError, MediaPipeline, detect_capabilities
 from .memory import tokenize
+from .resilience import call_with_resilience
 from .story import StoryBuilder, StoryError, validate_story
 from .thumbnail import primary_thumbnail
 
@@ -59,6 +60,7 @@ TOOL_NAMES: tuple[str, ...] = (
     "assemble_and_render_video",
     "inspect_rendered_output",
     "upload_to_youtube",
+    "upload_youtube_short",
     "send_direct_alert_to_creator",
 )
 
@@ -176,13 +178,21 @@ class StudioTools:
             "assemble_story_from_script",
             "inspect_rendered_output",
             "upload_to_youtube",
+            "upload_youtube_short",
             "send_direct_alert_to_creator",
         ):
             impl = getattr(self, name)
 
             @functools.wraps(impl)
-            def wrapper(*args: Any, __impl: Callable[..., str] = impl, **kwargs: Any) -> str:
-                return __impl(*args, **kwargs)
+            def wrapper(*args: Any, __impl: Callable[..., str] = impl, __name: str = name, **kwargs: Any) -> str:
+                # Self-healing: exception tak terduga tidak boleh mematikan GroupChat.
+                return call_with_resilience(
+                    __name,
+                    __impl,
+                    *args,
+                    notifier=self.notifier,
+                    **kwargs,
+                )
 
             functions[name] = wrapper
         return functions
@@ -933,6 +943,126 @@ class StudioTools:
         self._log("upload_youtube", mode="live", status="ok", video_id=video_id)
         return f"UPLOAD YOUTUBE SUKSES: {json.dumps(receipt, ensure_ascii=False)}"
 
+    def upload_youtube_short(
+        self,
+        short_filename: Annotated[
+            str,
+            "Nama file Shorts di ./output_ready/shorts/; kosongkan untuk memakai file .mp4 terbaru",
+        ] = "",
+        title: Annotated[
+            str,
+            "Judul Shorts (otomatis diberi #Shorts bila belum ada); kosongkan untuk memakai brief Vito",
+        ] = "",
+        privacy_status: Annotated[str, "Privasi: 'unlisted' (default), 'private', atau 'public'"] = "unlisted",
+        force: Annotated[bool, "True = upload ulang walau file ini sudah pernah tayang"] = False,
+    ) -> str:
+        """Publikasikan YouTube Shorts 9:16 dari ./output_ready/shorts/ (Sora)."""
+        from .shorts import (
+            RECEIPT_FILENAME as SHORTS_RECEIPT,
+        )
+        from .shorts import (
+            default_short_description,
+            default_short_title,
+            ensure_shorts_hashtag,
+            latest_short,
+            published_record,
+            record_publish,
+        )
+
+        if short_filename:
+            try:
+                short = self._safe_path(self.paths.output_ready, short_filename)
+            except ValueError as exc:
+                return f"ERROR UPLOAD SHORTS: {exc}"
+        else:
+            short = latest_short(self.settings)
+        if short is None or not short.is_file() or short.stat().st_size == 0:
+            return (
+                "TIDAK ADA SHORTS: belum ada file .mp4 di ./output_ready/shorts/. "
+                "Raka harus merender master dulu (auto-cutter berjalan setelah upload master)."
+            )
+
+        final_title = ensure_shorts_hashtag(title.strip() or default_short_title(self.settings))
+        description = default_short_description(final_title, duration=self.settings.shorts_duration)
+        tags = ["shorts", "ai", "teknologi", "otomasi"]
+        privacy = (privacy_status or "unlisted").strip().lower()
+        if privacy not in {"unlisted", "private", "public"}:
+            privacy = "unlisted"
+
+        previous = published_record(self.settings, short)
+        if previous and previous.get("status") in {"UPLOADED_LIVE", "UPLOADED_SIMULATION"} and not force:
+            payload = {
+                "status": "SUDAH_TAYANG",
+                "file": short.name,
+                "title": previous.get("title", ""),
+                "url": previous.get("url", ""),
+                "published_at": previous.get("published_at", ""),
+            }
+            self._log("upload_youtube_short", mode="skip", file=short.name)
+            return f"SHORTS SUDAH TAYANG: {json.dumps(payload, ensure_ascii=False)}"
+
+        client_secret = self.paths.root / "client_secret.json"
+        if not client_secret.exists():
+            record_publish(
+                self.settings,
+                short,
+                status="UPLOADED_SIMULATION",
+                title=final_title,
+                privacy=privacy,
+            )
+            receipt = {
+                "status": "UPLOADED_SIMULATION",
+                "file": short.name,
+                "title": final_title,
+                "privacy": privacy,
+                "tags": tags,
+                "video_url": "",
+                "note": "client_secret.json tidak ada → tidak ada video yang benar-benar tayang",
+                "next_step": "Taruh client_secret.json (OAuth Desktop) di root proyek untuk upload live.",
+                "created_at": _now(),
+            }
+            target = self.paths.output_ready / SHORTS_RECEIPT
+            target.write_text(json.dumps(receipt, indent=2, ensure_ascii=False), encoding="utf-8")
+            self._log("upload_youtube_short", mode="simulation", file=short.name)
+            return f"UPLOAD SHORTS (SIMULASI): {json.dumps(receipt, ensure_ascii=False)}"
+
+        try:
+            response = self._youtube_insert(
+                short, final_title, description, tags, privacy, apply_thumbnail=False
+            )
+        except Exception as exc:  # noqa: BLE001 - error API apa pun harus jadi pesan bot
+            self._log("upload_youtube_short", mode="live", status="error", error=str(exc))
+            return (
+                f"ERROR UPLOAD SHORTS: {type(exc).__name__}: {_short(str(exc), 300)}. "
+                "Jangan klaim Shorts sudah tayang."
+            )
+
+        video_id = str(response.get("id") or "")
+        url = f"https://youtu.be/{video_id}" if video_id else ""
+        record_publish(
+            self.settings,
+            short,
+            status="UPLOADED_LIVE",
+            title=final_title,
+            video_id=video_id,
+            url=url,
+            privacy=privacy,
+        )
+        receipt = {
+            "status": "UPLOADED_LIVE",
+            "file": short.name,
+            "title": final_title,
+            "video_id": video_id,
+            "url": url,
+            "privacy": privacy,
+            "tags": tags,
+            "created_at": _now(),
+        }
+        target = self.paths.output_ready / SHORTS_RECEIPT
+        target.write_text(json.dumps(receipt, indent=2, ensure_ascii=False), encoding="utf-8")
+        self._log("upload_youtube_short", mode="live", status="ok", video_id=video_id)
+        return f"SHORTS TERPUBLIKASI: {json.dumps(receipt, ensure_ascii=False)}"
+
     def send_direct_alert_to_creator(
         self,
         bot_sender_name: Annotated[
@@ -961,7 +1091,14 @@ class StudioTools:
         )
 
     def _youtube_insert(
-        self, video: Path, title: str, description: str, tags: list[str], privacy: str
+        self,
+        video: Path,
+        title: str,
+        description: str,
+        tags: list[str],
+        privacy: str,
+        *,
+        apply_thumbnail: bool = True,
     ) -> dict[str, Any]:
         """Upload asli via YouTube Data API v3 (import lazy: dependensi opsional)."""
         from google.auth.transport.requests import Request
@@ -998,7 +1135,11 @@ class StudioTools:
         media = MediaFileUpload(str(video), chunksize=8 * 1024 * 1024, resumable=True)
         request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
         response = request.execute()
-        response["_thumbnail_status"] = self._apply_thumbnail(youtube, str(response.get("id") or ""))
+        response["_thumbnail_status"] = (
+            self._apply_thumbnail(youtube, str(response.get("id") or ""))
+            if apply_thumbnail
+            else "skipped_short"
+        )
         return response
 
     def _apply_thumbnail(

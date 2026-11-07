@@ -384,3 +384,10 @@ def test_memory_tools_exposed_to_bots() -> None:
     assert {"get_recent_content_memory", "check_topic_similarity_in_memory"} <= tools["vito"]
     assert {"check_topic_similarity_in_memory", "register_new_episode_to_memory"} <= tools["damon"]
     assert "get_recent_content_memory" not in tools["sora"]
+
+
+def test_short_tool_owned_by_sora_only() -> None:
+    from studio.office import AGENT_SPECS
+
+    owners = [spec.key for spec in AGENT_SPECS if "upload_youtube_short" in spec.tools]
+    assert owners == ["sora"]

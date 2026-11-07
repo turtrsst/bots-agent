@@ -1,0 +1,47 @@
+{
+  "name": "KRA — Rekap Views Mingguan ke Telegram",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            { "field": "cronExpression", "expression": "5 0 * * 0" }
+          ]
+        }
+      },
+      "id": "cron-weekly-telegram-report",
+      "name": "Setiap Minggu 00:05 — Kirim Rekap Views Telegram",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [200, 1100]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://127.0.0.1:8100/kra/schedule/weekly-report",
+        "options": {}
+      },
+      "id": "http-trigger-weekly-report",
+      "name": "Panggil API Rekap Views KRA",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [460, 1100]
+    }
+  ],
+  "connections": {
+    "Setiap Minggu 00:05 — Kirim Rekap Views Telegram": {
+      "main": [
+        [
+          {
+            "node": "Panggil API Rekap Views KRA",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": { "executionOrder": "v1" },
+  "active": false,
+  "notes": "Jalankan setelah cron 00:00 sync-views. Parameter opsional: ?top=3, ?send=false untuk pratinjau teks saja."
+}

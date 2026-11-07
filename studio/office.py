@@ -85,8 +85,12 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "probe resolusi, dan laporan render. Ini satu-satunya sumber kebenaran kualitas."
     ),
     "upload_to_youtube": (
-        "Upload video final ke YouTube Data API v3 dengan metadata SEO + Chapters. "
+        "Upload video master final ke YouTube Data API v3 dengan metadata SEO + Chapters. "
         "Tanpa client_secret.json, tool menulis receipt simulasi."
+    ),
+    "upload_youtube_short": (
+        "Publikasikan YouTube Shorts 9:16 terbaru dari ./output_ready/shorts/ (judul otomatis "
+        "diberi #Shorts). Idempoten: file yang sudah tayang tidak di-upload ulang kecuali force."
     ),
     "send_direct_alert_to_creator": (
         "Kirim pesan/link langsung ke Telegram pribadi Creator. Panggil setelah upload "
@@ -203,7 +207,10 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
         fallback_prompt=(
             "Kamu Damon, Reality Checker dengan hak veto. Tahap 1: audit naskah Clara, beri SCRIPT PASS "
             "atau tolak. Tahap 2: setelah Raka render, WAJIB panggil inspect_rendered_output pada "
-            "'final_render.mp4'; beri VIDEO PASS hanya bila bukti fisik valid."
+            "'final_render.mp4'; beri VIDEO PASS hanya bila bukti fisik valid. Bila ada pesan "
+            "DIAGNOSTIC CRITICAL FAILURE, baca KATEGORI di dalamnya lalu perintahkan perbaikan "
+            "konkret (Clara: struktur naskah; Raka: render lebih ringan/fallback FFmpeg/mode "
+            "faceless), dan sebut ini percobaan ulang terakhir sebelum eskalasi ke Bima."
         ),
         protocol=(
             "## DUA GERBANG VETO\n"
@@ -318,13 +325,15 @@ AGENT_SPECS: tuple[AgentSpec, ...] = (
             "2. Susun judul final (<= 55 karakter, pakai pemenang dari brief), deskripsi dengan "
             "Chapters yang dimulai `00:00`, dan 5-10 tag.\n"
             "3. Panggil `upload_to_youtube(...)` dengan privacy_status 'unlisted'.\n"
-            "4. Laporkan hasil tool: URL/receipt, peringatan SEO, mode live atau simulasi.\n"
-            "5. Akhiri pesan dengan kata kunci persis: PIPELINE_COMPLETE."
+            "4. Bila ada file di ./output_ready/shorts/, panggil `upload_youtube_short(...)` "
+            "dengan privacy 'unlisted' dan laporkan statusnya (live/simulasi/sudah tayang).\n"
+            "5. Laporkan hasil tool: URL/receipt, peringatan SEO, mode live atau simulasi.\n"
+            "6. Akhiri pesan dengan kata kunci persis: PIPELINE_COMPLETE."
         ),
         default_reply=(
             "Upload sudah saya proses. Video final ada di ./output_ready/. PIPELINE_COMPLETE"
         ),
-        tools=("upload_to_youtube", "send_direct_alert_to_creator"),
+        tools=("upload_to_youtube", "upload_youtube_short", "send_direct_alert_to_creator"),
         handoff=("Damon_RealityChecker",),
     ),
 )

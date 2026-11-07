@@ -19,6 +19,8 @@ Dua kelompok endpoint:
 **Cron n100n (di luar dual-loop)**
 
 * ``POST /kra/schedule/sync-views``           — Minggu 00:00: sinkron views YouTube
+* ``POST /kra/schedule/weekly-report``        — Minggu 00:05: rekap views ke Telegram
+* ``POST /kra/schedule/publish-shorts``       — tiap hari 17:00: publikasikan Shorts terbaru
 
 **Dashboard & Telegram dua arah**
 
@@ -228,6 +230,92 @@ def create_app(daemon: Daemon, *, autostart: bool = True) -> Any:
         else:
             message = f"Sinkronisasi views gagal: {report.get('status')}"
         return {**report, "message": message}
+
+    # --------------------------------------------------- rekap mingguan (Telegram)
+    @app.post("/kra/schedule/weekly-report")
+    async def schedule_weekly_report(send: bool = True, top: int = 3) -> dict[str, Any]:
+        """Minggu 00:05 (n100n) — rekap views dari SQLite ke Telegram Creator."""
+        from .weekly_report import (
+            build_weekly_report,
+            format_weekly_report,
+            send_weekly_report,
+        )
+
+        if send:
+            result = send_weekly_report(daemon.memory, daemon.notifier, top=top)
+        else:
+            report = build_weekly_report(daemon.memory, top=top)
+            result = {
+                "status": "REPORT_READY",
+                "sent": False,
+                "report": report.as_dict(),
+                "text": format_weekly_report(report),
+            }
+        daemon.state.update(daemon.state.status(), weekly_report=result["report"])
+        daemon.chat_log.append(
+            "Sora_Publisher",
+            "Vito_TrendStrategist",
+            f"[REKAP MINGGUAN] {result['report']['total_views']} views dari "
+            f"{result['report']['total_videos']} video tayang "
+            f"({'terkirim' if result['sent'] else 'tidak terkirim'})",
+        )
+        return {
+            "status": result["status"],
+            "sent": result["sent"],
+            "message": (
+                "Rekap views mingguan terkirim ke Telegram."
+                if result["sent"]
+                else "Rekap dibuat, tetapi kanal Telegram tidak mengonfirmasi pengiriman."
+            ),
+            "report": result["report"],
+            "text": result["text"],
+        }
+
+    # ------------------------------------------------- publikasi Shorts (17:00)
+    @app.post("/kra/schedule/publish-shorts")
+    async def schedule_publish_shorts(
+        title: str = "", privacy: str = "unlisted", force: bool = False
+    ) -> dict[str, Any]:
+        """Tiap hari 17:00 (n100n) — upload Shorts terbaru ke YouTube sebagai Sora."""
+        import json as _json
+
+        from .shorts import format_publish_caption
+        from .tools import StudioTools
+
+        tools = StudioTools(daemon.settings, notifier=daemon.notifier, memory=daemon.memory)
+        reply = tools.upload_youtube_short(
+            title=title, privacy_status=privacy, force=force
+        )
+
+        label = reply.split(":", 1)[0].strip()
+        status = {
+            "SHORTS TERPUBLIKASI": "UPLOADED_LIVE",
+            "UPLOAD SHORTS (SIMULASI)": "UPLOADED_SIMULATION",
+            "SHORTS SUDAH TAYANG": "SUDAH_TAYANG",
+            "TIDAK ADA SHORTS": "TIDAK_ADA_SHORTS",
+        }.get(label, "ERROR")
+        payload: dict[str, Any] = {}
+        if ":" in reply:
+            try:
+                payload = _json.loads(reply.split(":", 1)[1].strip())
+            except _json.JSONDecodeError:
+                payload = {}
+        payload.setdefault("status", status)
+
+        daemon.state.update(daemon.state.status(), shorts_publish=payload)
+        daemon.chat_log.append(
+            "Sora_YouTubePublisher",
+            "Creator_Kamu",
+            f"[SHORTS PUBLISH] {status} " + (payload.get("file") or payload.get("title") or ""),
+        )
+        if status in {"UPLOADED_LIVE", "UPLOADED_SIMULATION"}:
+            daemon.notifier.send(format_publish_caption(payload))
+        return {
+            "status": status,
+            "message": reply.split(":", 1)[0],
+            "reply": reply,
+            "shorts": payload,
+        }
 
     # ------------------------------------------------------ endpoint tunggal
     @app.post("/kra/n100n-trigger", status_code=202)

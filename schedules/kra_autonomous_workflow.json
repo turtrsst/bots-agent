@@ -5,7 +5,10 @@
       "parameters": {
         "rule": {
           "interval": [
-            { "field": "cronExpression", "expression": "0 8 * * *" }
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * *"
+            }
           ]
         }
       },
@@ -13,7 +16,10 @@
       "name": "08:00 AM - Jadwal Rapat Script",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.1,
-      "position": [200, 200]
+      "position": [
+        200,
+        200
+      ]
     },
     {
       "parameters": {
@@ -28,13 +34,19 @@
       "name": "Trigger Vito & Clara (Buat Script JSON)",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.1,
-      "position": [460, 200]
+      "position": [
+        460,
+        200
+      ]
     },
     {
       "parameters": {
         "rule": {
           "interval": [
-            { "field": "minutes", "minutesInterval": 30 }
+            {
+              "field": "minutes",
+              "minutesInterval": 30
+            }
           ]
         }
       },
@@ -42,7 +54,10 @@
       "name": "Setiap 30 Menit - Cek Folder Creator",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.1,
-      "position": [200, 460]
+      "position": [
+        200,
+        460
+      ]
     },
     {
       "parameters": {
@@ -54,7 +69,10 @@
       "name": "Cek Status Bima (PM Gatekeeper)",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.1,
-      "position": [460, 460]
+      "position": [
+        460,
+        460
+      ]
     },
     {
       "parameters": {
@@ -71,7 +89,10 @@
       "name": "Apakah File Creator Siap?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 1,
-      "position": [700, 460]
+      "position": [
+        700,
+        460
+      ]
     },
     {
       "parameters": {
@@ -83,7 +104,10 @@
       "name": "Eksekusi Raka (Remotion+Concat) & Sora (YouTube Upload)",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.1,
-      "position": [960, 440]
+      "position": [
+        960,
+        440
+      ]
     },
     {
       "parameters": {},
@@ -91,25 +115,158 @@
       "name": "Belum Siap - Tunggu Siklus Berikutnya",
       "type": "n8n-nodes-base.noOp",
       "typeVersion": 1,
-      "position": [960, 620]
+      "position": [
+        960,
+        620
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 17 * * *"
+            }
+          ]
+        }
+      },
+      "id": "cron-evening-shorts-publish",
+      "name": "Setiap 17:00 WIB — Upload YouTube Shorts",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://127.0.0.1:8100/kra/schedule/publish-shorts",
+        "options": {}
+      },
+      "id": "http-trigger-publish-shorts",
+      "name": "Panggil API Publish Shorts KRA",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        460,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "5 0 * * 0"
+            }
+          ]
+        }
+      },
+      "id": "cron-weekly-telegram-report",
+      "name": "Setiap Minggu 00:05 — Kirim Rekap Views Telegram",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        1100
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://127.0.0.1:8100/kra/schedule/weekly-report",
+        "options": {}
+      },
+      "id": "http-trigger-weekly-report",
+      "name": "Panggil API Rekap Views KRA",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [
+        460,
+        1100
+      ]
     }
   ],
   "connections": {
     "08:00 AM - Jadwal Rapat Script": {
-      "main": [[{ "node": "Trigger Vito & Clara (Buat Script JSON)", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Trigger Vito & Clara (Buat Script JSON)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Setiap 30 Menit - Cek Folder Creator": {
-      "main": [[{ "node": "Cek Status Bima (PM Gatekeeper)", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Cek Status Bima (PM Gatekeeper)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Cek Status Bima (PM Gatekeeper)": {
-      "main": [[{ "node": "Apakah File Creator Siap?", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Apakah File Creator Siap?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Apakah File Creator Siap?": {
       "main": [
-        [{ "node": "Eksekusi Raka (Remotion+Concat) & Sora (YouTube Upload)", "type": "main", "index": 0 }],
-        [{ "node": "Belum Siap - Tunggu Siklus Berikutnya", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Eksekusi Raka (Remotion+Concat) & Sora (YouTube Upload)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Belum Siap - Tunggu Siklus Berikutnya",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Setiap 17:00 WIB — Upload YouTube Shorts": {
+      "main": [
+        [
+          {
+            "node": "Panggil API Publish Shorts KRA",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Setiap Minggu 00:05 — Kirim Rekap Views Telegram": {
+      "main": [
+        [
+          {
+            "node": "Panggil API Rekap Views KRA",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     }
   },
-  "settings": { "timezone": "Asia/Jakarta" }
+  "settings": {
+    "timezone": "Asia/Jakarta"
+  }
 }

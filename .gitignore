@@ -28,3 +28,7 @@ dist/
 .DS_Store
 .idea/
 .vscode/
+
+# Log PM2
+logs/*
+!logs/.gitkeep

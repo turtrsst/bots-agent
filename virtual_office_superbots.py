@@ -53,6 +53,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Mode faceless: tanpa rekaman Creator, narasi memakai TTS (ElevenLabs/Edge).",
     )
     parser.add_argument("--doctor", action="store_true", help="Cek konfigurasi + kapabilitas media lalu keluar.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validasi berperingkat: lingkungan, memori, mesin, notifikasi, API/dashboard (tanpa LLM).",
+    )
+    parser.add_argument(
+        "--send",
+        action="store_true",
+        help="Dipakai bersama --dry-run: benar-benar kirim satu pesan uji ke Telegram.",
+    )
     parser.add_argument("--status", action="store_true", help="Tampilkan antrean daemon + memori lalu keluar.")
     parser.add_argument(
         "--daemon",
@@ -169,6 +179,7 @@ def doctor(settings) -> int:
         )
     )
     print("  dashboard     : http://127.0.0.1:8100/ (Control Center 3 panel)")
+    print("  dry-run       : python virtual_office_superbots.py --dry-run [--send]")
     radar = "YouTube Data API" if settings.youtube_api_key else "yt-dlp fallback"
     print(f"  radar tren    : Google Trends RSS + Google News RSS + {radar}")
     print(f"  jadwal ideasi : {settings.schedule or 'nonaktif'}")
@@ -262,6 +273,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"   URL: {result.get('url')}")
             print("   Perintah: /status /riwayat /thumb 1 /approve /help")
         return 0 if result.get("ok") else 1
+
+    if args.dry_run:
+        from studio.dryrun import run_dry_run
+
+        return run_dry_run(settings, send=args.send)
 
     if args.doctor:
         return doctor(settings)

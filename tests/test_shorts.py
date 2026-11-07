@@ -116,3 +116,124 @@ def test_filter_complex_layout() -> None:
     assert chain.count(";") == 2
     assert chain.endswith("overlay=(W-w)/2:(H-h)/2[v]")
     assert "boxblur=24:24" in chain
+
+
+# --------------------------------------------------- publikasi Shorts (Sora)
+def _short_file(settings: Settings, name: str = "short_100.mp4", payload: bytes = b"v" * 1024) -> Path:
+    folder = settings.paths.output_ready / "shorts"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / name
+    path.write_bytes(b"\x00\x00\x00\x18ftypmp42" + payload)
+    return path
+
+
+def test_latest_short_picks_newest(settings: Settings) -> None:
+    import os
+
+    from studio.shorts import latest_short
+
+    assert latest_short(settings) is None
+    old = _short_file(settings, "short_1.mp4")
+    new = _short_file(settings, "short_2.mp4")
+    os.utime(old, (1_700_000_000, 1_700_000_000))
+    os.utime(new, (1_800_000_000, 1_800_000_000))
+    assert latest_short(settings) == new
+
+
+def test_title_has_hashtag_and_limit() -> None:
+    from studio.shorts import ensure_shorts_hashtag
+
+    assert ensure_shorts_hashtag("Kantor AI Tanpa Manusia") == "Kantor AI Tanpa Manusia #Shorts"
+    assert ensure_shorts_hashtag("Kantor AI #shorts") == "Kantor AI #shorts"
+    long_title = ensure_shorts_hashtag("judul " * 40)
+    assert len(long_title) <= 100
+    assert long_title.lower().endswith("#shorts")
+
+
+def test_default_title_uses_brief(settings: Settings) -> None:
+    import json
+
+    from studio.shorts import default_short_title
+
+    settings.paths.workspace.mkdir(parents=True, exist_ok=True)
+    (settings.paths.workspace / "content_brief.json").write_text(
+        json.dumps({"titles": [{"title": "Kantor AI Tanpa Manusia"}]}), encoding="utf-8"
+    )
+    assert default_short_title(settings) == "Kantor AI Tanpa Manusia #Shorts"
+
+
+def test_upload_simulation_records_manifest(settings: Settings) -> None:
+    import json
+
+    from studio.tools import StudioTools
+
+    short = _short_file(settings)
+    studio = StudioTools(settings)
+    result = studio.upload_youtube_short(privacy_status="unlisted")
+    assert result.startswith("UPLOAD SHORTS (SIMULASI)")
+
+    manifest = json.loads((settings.paths.workspace / "shorts_published.json").read_text())
+    record = manifest[short.name]
+    assert record["status"] == "UPLOADED_SIMULATION"
+    assert record["title"].endswith("#Shorts")
+    receipt = json.loads(
+        (settings.paths.output_ready / "shorts_publish_receipt.json").read_text(encoding="utf-8")
+    )
+    assert receipt["privacy"] == "unlisted"
+
+    again = studio.upload_youtube_short()
+    assert again.startswith("SHORTS SUDAH TAYANG")
+    forced = studio.upload_youtube_short(force=True)
+    assert forced.startswith("UPLOAD SHORTS (SIMULASI)")
+
+
+def test_upload_without_shorts_is_honest(settings: Settings) -> None:
+    from studio.tools import StudioTools
+
+    result = StudioTools(settings).upload_youtube_short()
+    assert result.startswith("TIDAK ADA SHORTS")
+    assert "output_ready/shorts/" in result
+
+
+def test_upload_live_uses_api_and_skips_thumbnail(settings: Settings, monkeypatch) -> None:
+    from studio.tools import StudioTools
+
+    _short_file(settings)
+    (settings.paths.root / "client_secret.json").write_text("{}", encoding="utf-8")
+    calls: list[dict] = []
+
+    def fake_insert(self, video, title, description, tags, privacy, **kwargs):
+        calls.append(
+            {
+                "video": video,
+                "title": title,
+                "privacy": privacy,
+                "apply_thumbnail": kwargs.get("apply_thumbnail"),
+            }
+        )
+        return {"id": "short123"}
+
+    monkeypatch.setattr(StudioTools, "_youtube_insert", fake_insert)
+    result = StudioTools(settings).upload_youtube_short(title="Kantor AI")
+    assert result.startswith("SHORTS TERPUBLIKASI")
+    assert calls[0]["privacy"] == "unlisted"
+    assert calls[0]["apply_thumbnail"] is False
+    assert calls[0]["title"] == "Kantor AI #Shorts"
+    assert "https://youtu.be/short123" in result
+
+
+def test_upload_live_error_is_reported(settings: Settings, monkeypatch) -> None:
+    from studio.tools import StudioTools
+
+    _short_file(settings)
+    (settings.paths.root / "client_secret.json").write_text("{}", encoding="utf-8")
+
+    def broken(self, *_args, **_kwargs):
+        raise RuntimeError("invalid_grant")
+
+    monkeypatch.setattr(StudioTools, "_youtube_insert", broken)
+    result = StudioTools(settings).upload_youtube_short()
+    assert result.startswith("ERROR UPLOAD SHORTS")
+    assert "Jangan klaim" in result
+    manifest = settings.paths.workspace / "shorts_published.json"
+    assert not manifest.exists()  # gagal tidak dicatat sebagai tayang

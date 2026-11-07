@@ -16,6 +16,7 @@ mengembalikan laporan `SKIP_TANPA_FFMPEG` (jujur), bukan mengaku sukses.
 
 from __future__ import annotations
 
+import json
 import shutil
 import time
 from collections.abc import Callable
@@ -26,6 +27,9 @@ from typing import Any
 from .config import Settings
 
 SHORTS_DIRNAME = "shorts"
+MANIFEST_FILENAME = "shorts_published.json"        # di workspace/: jejak upload Shorts
+RECEIPT_FILENAME = "shorts_publish_receipt.json"   # di output_ready/: receipt terakhir
+HASHTAG = "#Shorts"
 DEFAULT_MASTER = "final_render.mp4"
 DEFAULT_DURATION = 45
 MIN_DURATION = 30
@@ -207,6 +211,160 @@ def generate_youtube_short(
         command=command,
         elapsed=time.monotonic() - started,
     )
+
+
+# --------------------------------------------------------------- katalog Shorts
+def shorts_dir(settings: Settings) -> Path:
+    return settings.paths.output_ready / SHORTS_DIRNAME
+
+
+def latest_short(settings: Settings) -> Path | None:
+    """File `.mp4` terbaru di `output_ready/shorts/` (atau ``None``)."""
+    folder = shorts_dir(settings)
+    if not folder.is_dir():
+        return None
+    files = [
+        path
+        for path in folder.glob("*.mp4")
+        if path.is_file() and path.stat().st_size > 0
+    ]
+    if not files:
+        return None
+    return max(files, key=lambda path: path.stat().st_mtime)
+
+
+def manifest_path(settings: Settings) -> Path:
+    return settings.paths.workspace / MANIFEST_FILENAME
+
+
+def load_manifest(settings: Settings) -> dict[str, Any]:
+    path = manifest_path(settings)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def published_record(settings: Settings, short: Path) -> dict[str, Any] | None:
+    """Catatan upload sebelumnya untuk file ini (idempotensi cron 17:00)."""
+    record = load_manifest(settings).get(short.name)
+    if not isinstance(record, dict):
+        return None
+    if int(record.get("size_bytes", -1)) != short.stat().st_size:
+        return None  # file berubah → anggap versi baru
+    return record
+
+
+def record_publish(
+    settings: Settings,
+    short: Path,
+    *,
+    status: str,
+    title: str,
+    video_id: str = "",
+    url: str = "",
+    privacy: str = "unlisted",
+) -> dict[str, Any]:
+    manifest = load_manifest(settings)
+    record = {
+        "file": short.name,
+        "size_bytes": short.stat().st_size,
+        "status": status,
+        "title": title,
+        "video_id": video_id,
+        "url": url,
+        "privacy": privacy,
+        "published_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    manifest[short.name] = record
+    path = manifest_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    return record
+
+
+def ensure_shorts_hashtag(title: str, *, limit: int = 100) -> str:
+    """Pastikan judul memuat `#Shorts` dan tidak melebihi batas YouTube."""
+    clean = " ".join(str(title or "").split())
+    if not clean:
+        clean = "Fakta Menarik AI"
+    if HASHTAG.lower() not in clean.lower():
+        clean = f"{clean} {HASHTAG}"
+    if len(clean) > limit:
+        keep = clean[:limit].rstrip()
+        if HASHTAG.lower() not in keep.lower():
+            keep = keep[: limit - len(HASHTAG) - 1].rstrip() + " " + HASHTAG
+        clean = keep
+    return clean
+
+
+def default_short_title(settings: Settings) -> str:
+    """Judul Shorts dari brief Vito → judul episode terakhir → fallback jujur."""
+    brief_path = settings.paths.workspace / "content_brief.json"
+    if brief_path.is_file():
+        try:
+            brief = json.loads(brief_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            brief = {}
+        for key in ("titles", "title_options"):
+            items = brief.get(key) or []
+            for item in items if isinstance(items, list) else []:
+                if isinstance(item, dict) and item.get("title"):
+                    return ensure_shorts_hashtag(str(item["title"]))
+                if isinstance(item, str) and item.strip():
+                    return ensure_shorts_hashtag(item)
+        if brief.get("title"):
+            return ensure_shorts_hashtag(str(brief["title"]))
+    try:
+        from .memory import MemoryStore
+
+        memory = MemoryStore(settings.memory_db_path)
+        episodes = memory.recent_episodes(1)
+        if episodes and episodes[0].get("primary_title"):
+            return ensure_shorts_hashtag(str(episodes[0]["primary_title"]))
+    except Exception:  # noqa: BLE001 - judul default tidak boleh mematikan publish
+        pass
+    return ensure_shorts_hashtag("Fakta Menarik AI")
+
+
+def default_short_description(title: str, *, duration: int = DEFAULT_DURATION) -> str:
+    clean = str(title or "").replace(HASHTAG, "").strip()
+    return (
+        f"{clean}\n\n"
+        f"Potongan {int(duration)} detik dari kantor virtual AI otonom KRA: enam agent "
+        "menyusun naskah, merender, dan mengaudit sendiri.\n\n"
+        "#shorts #ai #teknologi"
+    )
+
+
+def format_publish_caption(report: dict[str, Any]) -> str:
+    status = report.get("status", "")
+    title = report.get("title", "")
+    if status == "UPLOADED_LIVE":
+        return (
+            "📱 <b>[KRA SHORTS PUBLISHED]</b>\n"
+            f"<b>{title}</b>\n"
+            f"🔗 {report.get('url')}\n"
+            f"Privasi: {report.get('privacy')} · file: <code>{report.get('file')}</code>"
+        )
+    if status == "UPLOADED_SIMULATION":
+        return (
+            "📱 <b>[KRA SHORTS]</b> UPLOAD SIMULASI (BUKAN LIVE)\n"
+            f"<b>{title}</b>\n"
+            "client_secret.json belum ada, jadi tidak ada video yang benar-benar tayang."
+        )
+    if status == "SUDAH_TAYANG":
+        return (
+            "☑️ Shorts terbaru sudah pernah dipublikasikan "
+            f"(<code>{report.get('file')}</code>, {report.get('published_at', '-')}). "
+            "Tidak di-upload ulang."
+        )
+    if status == "TIDAK_ADA_SHORTS":
+        return "📭 Belum ada file Shorts di <code>output_ready/shorts/</code>."
+    return f"⚠️ <b>[KRA SHORTS]</b> {status}: {report.get('error', '')}"
 
 
 def format_shorts_caption(report: ShortsReport) -> str:

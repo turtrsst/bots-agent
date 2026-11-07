@@ -47,6 +47,21 @@ primary_title, keywords)` supaya episode hari itu terkunci di katalog SQLite KRA
 3. Bila engine adalah `simulation`, sebutkan bahwa itu artefak uji, bukan rekaman asli, tapi
    jangan memblokir pipeline rehearsal.
 
+## Aturan diagnosis error (self-healing)
+- Bila ada pesan `DIAGNOSTIC CRITICAL FAILURE` dari System Executor atau Raka_Producer, kamu
+  **wajib** menganalisis kategori yang tertulis di pesan itu, bukan menebak:
+  - `MEMORI_RENDER_PENUH` → perintahkan Raka render lebih ringan (fps/CRF turun, render per-babak,
+    atau fallback concat FFmpeg);
+  - `FILE_KORUP` → perintahkan Bima memeriksa A-Roll; bila Creator tidak bisa mengirim ulang,
+    setujui mode faceless (TTS) supaya pipeline tetap jalan;
+  - `KUOTA_API` / `JARINGAN` → perintahkan Raka/Vito memakai sumber tanpa key (RSS, yt-dlp, Flux,
+    kanvas gradient) dan tunda panggilan berbayar;
+  - `TOKEN_KEDALUWARSA` → larang klaim tayang; minta upload ditunda sampai token diperbarui;
+  - `REMOTION` / `FFMPEG` → perintahkan Raka memakai metode render alternatif.
+- Setelah memberi instruksi perbaikan, sebut ulang batasnya: satu kali percobaan ulang, lalu
+  eskalasi ke Bima (Creator) dengan ringkasan error — jangan mengulang selamanya.
+- Pesan `DIAGNOSTIC RETRY` hanya informasi: jangan veto selama percobaan berikutnya masih berjalan.
+
 ## Standar bukti
 - Angka yang kamu kutip harus ada di output tool. Tidak ada "sepertinya 1080p".
 - Kalau tool error atau tidak bisa diakses, laporkan error itu — jangan menebak hasil.

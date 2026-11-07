@@ -132,3 +132,45 @@ def test_weekly_sync_endpoint_is_honest_without_key(client) -> None:
     assert body["status"] in {"EMPTY", "NO_KEY"}
     assert "message" in body
     assert daemon.state.read()["details"]["views_sync"]["status"] == body["status"]
+
+
+# --------------------------------------------- publikasi Shorts & rekap views
+def test_publish_shorts_endpoint_without_file(client) -> None:
+    test_client, daemon = client
+    body = test_client.post("/kra/schedule/publish-shorts").json()
+    assert body["status"] == "TIDAK_ADA_SHORTS"
+    assert daemon.state.read()["details"]["shorts_publish"]["status"] == "TIDAK_ADA_SHORTS"
+
+
+def test_publish_shorts_endpoint_simulation(client, settings: Settings) -> None:
+    test_client, daemon = client
+    folder = settings.paths.output_ready / "shorts"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "short_123.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"v" * 512)
+
+    body = test_client.post("/kra/schedule/publish-shorts?privacy=unlisted").json()
+    assert body["status"] == "UPLOADED_SIMULATION"
+    assert body["shorts"]["file"] == "short_123.mp4"
+    assert any("[SHORTS PUBLISH]" in item["message"] for item in daemon.chat_log.all())
+
+    again = test_client.post("/kra/schedule/publish-shorts").json()
+    assert again["status"] == "SUDAH_TAYANG"
+
+
+def test_weekly_report_endpoint_preview(client) -> None:
+    test_client, daemon = client
+    daemon.memory.register_episode("p1", topic_summary="kantor ai", primary_title="Kantor AI")
+    daemon.memory.mark_episode_published("p1", video_id="v1", url="https://youtu.be/v1")
+
+    body = test_client.post("/kra/schedule/weekly-report?send=false").json()
+    assert body["status"] == "REPORT_READY"
+    assert body["report"]["total_videos"] == 1
+    assert "REKAPITULASI VIEWS MINGGUAN" in body["text"]
+    assert daemon.state.read()["details"]["weekly_report"]["total_videos"] == 1
+
+
+def test_weekly_report_endpoint_sends_to_notifier(client, notifier) -> None:
+    test_client, _ = client
+    body = test_client.post("/kra/schedule/weekly-report").json()
+    assert body["sent"] is True
+    assert notifier.messages and "REKAPITULASI" in notifier.messages[-1]

@@ -64,6 +64,8 @@ Perintah lain:
 
 ```bash
 python virtual_office_superbots.py --doctor          # cek API key, persona, ffmpeg, Whisper, memori
+python virtual_office_superbots.py --dry-run         # validasi 5 fase: env, memori, mesin, notifikasi, API
+python virtual_office_superbots.py --dry-run --send  # sama + kirim 1 pesan uji ke Telegram
 python virtual_office_superbots.py --mock-creator    # file A-Roll dummy otomatis (CI/demo)
 python virtual_office_superbots.py --real-render     # aktifkan ffmpeg asli
 python virtual_office_superbots.py --status          # antrean daemon + isi memori
@@ -455,6 +457,8 @@ python virtual_office_superbots.py --serve --host 0.0.0.0 --port 8100
 | `GET /status` | antrean, job terakhir, isi memori, status pipeline |
 | `GET /jobs/{id}` | detail satu job |
 | `POST /kra/schedule/sync-views` | cron Minggu 00:00: perbarui `views_count` dari YouTube (§7e) |
+| `POST /kra/schedule/weekly-report` | cron Minggu 00:05: rekap views + Top 3 ke Telegram (§7e) |
+| `POST /kra/schedule/publish-shorts` | cron 17:00: publikasikan Shorts terbaru ke YouTube (§7e) |
 | `GET /` • `/dashboard` | **KRA Control Center**, 3 panel real-time (§7e) |
 | `GET /api/state` • `/api/logs` • `/api/history` • `/api/thumbnails` | data JSON untuk dashboard (§7e) |
 | `POST /api/thumbnail/select?index=N` | pilih variasi thumbnail A/B (§7e) |
@@ -825,6 +829,95 @@ Node n8n siap impor ada di `schedules/kra_weekly_sync_views.json` (cron `0 0 * *
 langsung bisa diperiksa scheduler; daemon juga menyinkronkan otomatis di awal rapat ideasi bila
 `YOUTUBE_API_KEY` tersedia.
 
+### Publikasi Shorts otomatis jam 17:00 (`POST /kra/schedule/publish-shorts`)
+
+Cron sore mengambil file `.mp4` **terbaru** di `output_ready/shorts/` lalu mengunggahnya sebagai
+Sora, dengan judul otomatis diberi `#Shorts` (sumber: brief Vito → episode terakhir → fallback
+"Fakta Menarik AI #Shorts", dipotong agar ≤ 100 karakter):
+
+```bash
+curl -s -X POST "http://127.0.0.1:8100/kra/schedule/publish-shorts?privacy=unlisted"
+# {"status":"UPLOADED_LIVE","shorts":{"file":"short_1762…​.mp4","url":"https://youtu.be/…"}}
+```
+
+| Status | Arti |
+|---|---|
+| `UPLOADED_LIVE` | Shorts benar-benar tayang; receipt di `output_ready/shorts_publish_receipt.json` |
+| `UPLOADED_SIMULATION` | `client_secret.json` belum ada → **tidak ada** video yang tayang |
+| `SUDAH_TAYANG` | file ini sudah pernah di-upload (idempoten; cron harian tidak menggandakan) |
+| `TIDAK_ADA_SHORTS` | folder `shorts/` kosong — Raka belum merender |
+| `ERROR` | upload gagal; pesan asli tool dikembalikan, tidak diklaim sukses |
+
+Idempotensinya memakai `workspace/shorts_published.json` (nama file + ukuran + status + video id).
+Kalau file dirender ulang dengan ukuran berbeda, dianggap versi baru dan boleh di-upload; `?force=true`
+memaksa upload ulang. Node n8n: `schedules/kra_evening_shorts_publish.json` (cron `0 17 * * *`) — dua node yang sama juga
+sudah ditambahkan ke `schedules/kra_autonomous_workflow.json`.
+
+### Rekap performa mingguan ke Telegram (`POST /kra/schedule/weekly-report`)
+
+Minggu 00:05 — 5 menit setelah sync views — `studio/weekly_report.py` membaca katalog SQLite dan
+mengirim rekap HTML:
+
+```text
+📈 [KRA KANTOR VIRTUAL] REKAPITULASI VIEWS MINGGUAN
+🎬 Total Video Tayang: 7 video
+👁️ Akumulasi Views: 48.210 views
+📊 Rata-rata per Video: 6.887 views
+🏆 TOP 3 KONTEN TERPOPULER:
+1. Kantor AI Tanpa Manusia        └ 👁️ 21.400 views
+...
+🤖 Vito & Clara memakai data ini untuk memilih tema minggu depan.
+```
+
+Angka diambil apa adanya dari kolom `views_count` hasil sinkronisasi terakhir — laporan menyebut
+waktu sinkronisasi dan memberi catatan bila semua video masih 0 views (artinya `YOUTUBE_API_KEY`
+belum diisi), bukan mengarang pertumbuhan. Pratinjau tanpa mengirim:
+`curl -X POST ".../kra/schedule/weekly-report?send=false"`. Node n8n:
+`schedules/kra_weekly_report.json` (cron `5 0 * * 0`), juga sudah menempel di
+`schedules/kra_autonomous_workflow.json`.
+
+---
+
+## 7f. Ketahanan pipeline: auto-retry & diagnosa (`studio/resilience.py`)
+
+Padanan `kra_error_handler.py` (spec Creator). Setiap tool yang dipanggil AutoGen sekarang lewat
+`call_with_resilience()`, jadi satu exception tak terduga tidak lagi mematikan rapat:
+
+| Kelas tool | Perlakuan |
+|---|---|
+| aman diulang (`assemble_*`, `research_*`, `scan_*`, `inspect_*`, memori baca) | hingga **3 percobaan** dengan backoff 4 s → 8 s |
+| punya efek samping (`upload_*`, `save_*`, `send_alert`, `register_episode`, creator gate) | **sekali** percobaan — mencegah video/pesan ganda |
+
+Saat semua percobaan habis, tool mengembalikan string
+`DIAGNOSTIC CRITICAL FAILURE: … KATEGORI=<X> …` dan laporan HTML dikirim ke Telegram:
+
+```text
+❌ [KRA AUTO-HEALING GAGAL]
+🛠️ Tool: assemble_and_render_video     🔄 Percobaan: 3×
+🧭 Kategori: MEMORI_RENDER_PENUH — Render kehabisan memori
+🩹 Saran fallback: turunkan fps, render per-babak, atau pakai concat FFmpeg.
+```
+
+Kategori yang dikenali (`classify_error`): `MEMORI_RENDER_PENUH`, `FILE_KORUP`, `KUOTA_API`,
+`TOKEN_KEDALUWARSA`, `JARINGAN`, `FFMPEG`, `REMOTION`, `TIDAK_DIKENAL` — masing-masing dengan
+saran fallback di `ERROR_PLAYBOOK`.
+
+**Damon** menerima aturan diagnosis di persona `agents/reality-checker.md`: bila menerima
+`DIAGNOSTIC CRITICAL FAILURE`, ia wajib membaca kategori lalu memerintahkan perbaikan konkret
+(Clara memperbaiki struktur naskah; Raka render lebih ringan / fallback FFmpeg / pindah ke mode
+faceless), menyebut ini percobaan ulang terakhir sebelum eskalasi ke Bima. Pesan `DIAGNOSTIC RETRY`
+hanya informasi, bukan alasan veto.
+
+Dekoratornya juga bisa dipakai mandiri:
+
+```python
+from studio.resilience import resilient_tool
+
+@resilient_tool(max_retries=3, delay_seconds=4)
+def render_berat() -> str:
+    ...
+```
+
 ---
 
 ## 8. Memori jangka panjang
@@ -929,15 +1022,19 @@ studio/
   chatlog.py                  # chat_logs.json: 100 pesan terakhir GroupChat untuk dashboard
   dashboard.py                # KRA Control Center: HTML 3 panel + /api/state|logs|history|thumbnails
   telegram_webhook.py         # Telegram dua arah: /status /riwayat /thumb /approve + setWebhook
-  shorts.py                   # YouTube Shorts 9:16: blur background stack via ffmpeg
+  shorts.py                   # YouTube Shorts 9:16: render blur-stack, katalog & publikasi idempoten
+  weekly_report.py            # rekap views mingguan (Top 3) untuk Telegram
+  resilience.py               # auto-retry tool + klasifikasi error + laporan diagnosa ke Telegram
+  dryrun.py                   # --dry-run: validasi 5 fase (env, memori, mesin, notifikasi, API)
   daemon.py                   # antrean job, watcher, scheduler, perintah Telegram
   api.py                      # FastAPI: /kra/schedule/1..3, /kra/n100n-trigger, /health, /status, dashboard
   report.py                   # transkrip & ringkasan run
   rehearsal.py                # pipeline deterministik tanpa LLM
 agents/*.md                   # persona 6 bot
 remotion_template/            # Root.tsx + StoryScene.tsx untuk kantor-rama-ai/remotion_studio
-schedules/                    # kra_autonomous_workflow.json (n8n dual-loop) + kra_weekly_sync_views.json
-tests/                        # 270 test: unit, daemon, API, dashboard, webhook, shorts, story, memori
+schedules/                    # n8n: workflow dual-loop, sync views, rekap mingguan, publish Shorts
+ecosystem.config.js           # PM2: satu proses --serve (bridge + dashboard + daemon)
+tests/                        # 302 test: unit, daemon, API, dashboard, webhook, shorts, resilience, memori
 requirements-daemon.txt       # fastapi + uvicorn (mode --serve)
 requirements-media.txt        # openai-whisper (+ catatan ffmpeg/auto-editor/remotion)
 ```
@@ -972,7 +1069,7 @@ tetap macet, `max_round` menghentikannya dan laporan berstatus
 
 ```bash
 pip install -r requirements-dev.txt
-pytest            # 270 test
+pytest            # 302 test
 ruff check .
 ```
 
@@ -991,6 +1088,9 @@ ruff check .
 - `tests/test_broll.py` — empat tier visual dengan transport palsu, cache, sanitasi nama, dan kegagalan jujur.
 - `tests/test_thumbnail.py` — perencanaan varian dari brief, `npx remotion still` palsu, batas 2 MB, pratinjau Telegram.
 - `tests/test_research.py` (radar) — parsing Google Trends/News RSS, Outlier Score, fallback yt-dlp, dan kejujuran tanpa jaringan.
+- `tests/test_resilience.py` — klasifikasi error, retry berjenjang 4→8 s, tool efek-samping tidak diulang, laporan diagnosa, tool registry tidak pernah melempar exception.
+- `tests/test_weekly_report.py` — agregasi hanya `PUBLISHED`, rata-rata, Top 3 + tautan, peringatan 0 views, notifier rusak.
+- `tests/test_dryrun.py` — `--dry-run` lulus tanpa FastAPI dan memeriksa endpoint in-process.
 - `tests/test_chatlog.py` — buffer 100 pesan, tulis atomik, pemulihan JSON rusak, infersi penerima, panggilan tool.
 - `tests/test_office_chatlog.py` — `Office.run()` mencatat rapat berjalan (bukan setelah selesai), tanpa duplikasi antar-rapat, dan tetap tersimpan bila rapat crash.
 - `tests/test_dashboard.py` — halaman 3 panel tanpa CDN, `/api/state|logs|history|thumbnails`, pemilihan thumbnail A/B, dan cron `sync-views` yang jujur tanpa key.
@@ -1045,6 +1145,9 @@ dijawab deterministik, tetapi seluruh mesin AutoGen tetap berjalan.
 | Panel chat kosong padahal rapat jalan | `workspace/chat_logs.json` ditulis `Office.run()`; cek `StudioTools` log di `workspace/studio_log.jsonl` dan pastikan root studio sama |
 | Webhook Telegram balas `403` | `TELEGRAM_WEBHOOK_SECRET` diset tetapi header `secret_token` tidak dikirim saat `setWebhook`; daftarkan ulang lewat `--set-webhook` |
 | `/approve` bilang "belum ada naskah" | Pipeline memang `IDLE`/`SCRIPTING`; jalankan rapat dulu (`/topic …` atau jadwal 08:00) |
+| `DIAGNOSTIC CRITICAL FAILURE: … KATEGORI=…` | Auto-retry habis. Baca kategori: `MEMORI_RENDER_PENUH` (ringankan render), `FILE_KORUP` (A-Roll rusak/0 byte), `KUOTA_API`, `TOKEN_KEDALUWARSA` (hapus `token.json`, otorisasi ulang) |
+| `/kra/schedule/publish-shorts` → `SUDAH_TAYANG` | Itu idempoten: file Shorts itu sudah pernah di-upload. Render Shorts baru atau pakai `?force=true` |
+| `WEEKLY_REPORT_TIDAK_TERKIRIM` | Rekap tetap dibuat (ada di respons), tetapi kanal Telegram menolak — cek token/chat id |
 | Shorts `SKIP_TANPA_FFMPEG` | Install ffmpeg, atau set `STUDIO_SHORTS=0` bila tidak ingin Shorts |
 | `python: no such module: fts5` | Build SQLite tanpa FTS5; modul otomatis memakai pemindaian penuh (`memory.fts = False`), tidak ada fitur yang hilang |
 | `views_count` tetap 0 | `YOUTUBE_API_KEY` kosong atau video masih `UPLOADED_SIMULATION` (tidak punya `youtube_video_id`) |
@@ -1071,3 +1174,66 @@ tool dan persona tetap.
 - Tool memvalidasi semua path relatif terhadap folder studio; bot tidak bisa menulis
   ke luar `workspace/`, `input_creator/`, `output_ready/`.
 - Upload default `unlisted`, `selfDeclaredMadeForKids=false`.
+
+---
+
+## 15. Deploy VPS & dry-run
+
+### Satu proses, banyak peran
+
+Tidak perlu `uvicorn kra_dashboard_server:app` terpisah: `--serve` menjalankan **satu** proses yang
+melayani bridge n100n, dashboard, webhook Telegram, sekaligus daemon (scheduler ideasi, watcher
+`input_creator/`, antrean render, sinkronisasi views).
+
+```bash
+sudo apt update && sudo apt install -y ffmpeg
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt -r requirements-daemon.txt -r requirements-media.txt
+cp .env.example .env        # isi STUDIO_API_KEY, Telegram, YOUTUBE_API_KEY (semua opsional)
+```
+
+### PM2 (hidup lagi setelah reboot)
+
+```bash
+pm2 start ecosystem.config.js     # satu app: kra-server (python .venv/bin/python … --serve)
+pm2 logs kra-server
+pm2 save && pm2 startup
+```
+
+`ecosystem.config.js` sudah menyetel `STUDIO_ASYNC_GATE=1` (wajib: tidak ada `input()` di server),
+log ke `logs/kra-server.{out,err}.log`, `autorestart` + `restart_delay` 5 s.
+
+### Dry-run berperingkat (satu perintah)
+
+```bash
+python virtual_office_superbots.py --dry-run          # tanpa mengirim pesan
+python virtual_office_superbots.py --dry-run --send   # + kirim 1 pesan uji Telegram
+```
+
+| Fase | Yang benar-benar diperiksa |
+|---|---|
+| 1 Lingkungan | Python, `pyautogen`, ffmpeg/ffprobe, Whisper, npx + folder Remotion, status Shorts |
+| 2 Memori | SQLite terbuka, FTS5 ada/tidak, hitungan rapat & episode, skor kemiripan contoh (≥ 0,55) |
+| 3 Mesin | mesin TTS terpilih, provider B-Roll, radar (API key atau yt-dlp), thumbnail tersedia |
+| 4 Notifikasi | kanal aktif; `--send` mengirim pesan uji dan melaporkan apakah benar-benar terkirim |
+| 5 API | `/health`, dashboard `/`, `/api/state`, gate n100n, webhook `/help`, rekap mingguan, publish Shorts — lewat `TestClient` in-process (tanpa port, tanpa jaringan) |
+
+Exit code `0` hanya bila tidak ada kegagalan kritis; peringatan (ffmpeg/remotion/Telegram belum ada)
+tetap dilaporkan apa adanya, bukan disembunyikan. Setelah itu: `--rehearsal` (uji alur tanpa LLM),
+lalu `--serve`/`--daemon`.
+
+### Siklus harian yang dihasilkan
+
+| Waktu | Pemicu | Yang terjadi |
+|---|---|---|
+| 08:00 | n100n `1-start-script` | Vito riset + cek memori → Clara naskah → Damon `SCRIPT PASS` → Bima kirim Telegram |
+| siang | Anda | Taruh `a_roll_raw.mp4` di `input_creator/` (atau abaikan: mode faceless) / `/approve`, `/thumb 2` |
+| sore | watcher / `3-produce-and-upload` | Raka render master + thumbnail + Shorts → Damon QC → Sora upload master |
+| 17:00 | n100n `publish-shorts` | Shorts terbaru di-upload (idempoten, `#Shorts`) |
+| Minggu 00:00 | n100n `sync-views` | `views_count` semua episode diperbarui dari YouTube |
+| Minggu 00:05 | n100n `weekly-report` | Rekap views + Top 3 dikirim ke Telegram |
+
+> File `.md`/`.py` di spec Creator (`kra_shorts_generator.py`, `kra_error_handler.py`,
+> `kra_weekly_report.py`, `kra_dashboard_server.py`) tidak dibuat terpisah — Padanannya ada di
+> dalam paket `studio/` agar tetap satu paket yang diuji: `shorts.py`, `resilience.py`,
+> `weekly_report.py`, `dashboard.py`.
